@@ -6,6 +6,7 @@ import math
 import operator
 import warnings
 from collections.abc import Iterable
+from fractions import Fraction
 from functools import partial, reduce
 from itertools import product, repeat
 from numbers import Integral, Number
@@ -66,10 +67,347 @@ def nannumel(x, **kwargs):
     return nannumel_lookup(x, **kwargs)
 
 
+# ---------------------------------------------------------------------------
+# Exact, chunking-independent floating-point reductions
+#
+# Every binary (or complex) floating-point number is an exact rational.  Each
+# chunk accumulates the exact rational sum of its elements with
+# ``fractions.Fraction``, together with an element count and NaN/infinity
+# flags.  Fraction addition is associative and commutative, so the tree
+# combine step yields a result that is independent of chunking, split_every
+# and the task execution order.  The aggregate step performs a single,
+# correctly rounded (round-to-nearest, ties-to-even) conversion to the target
+# floating-point precision, componentwise for complex numbers.
+# ---------------------------------------------------------------------------
+
+_IEEE_FLOAT_PARAMS: dict[np.dtype, tuple[int, int]] = {
+    np.dtype(np.float16): (11, 15),
+    np.dtype(np.float32): (24, 127),
+    np.dtype(np.float64): (53, 1023),
+}
+
+
+def _power_of_two(n: int) -> Fraction:
+    return Fraction(1 << n) if n >= 0 else Fraction(1, 1 << -n)
+
+
+def _fraction_to_float(value: Fraction, dtype: np.dtype | str):
+    """Round an exact rational to the nearest binary float (ties to even).
+
+    Implements IEEE 754 round-to-nearest, ties-to-even for binary16/32/64,
+    including subnormal numbers and overflow to infinity.  The result does not
+    depend on the rounding of any intermediate operation.
+    """
+    dt = np.dtype(dtype)
+    p, emax = _IEEE_FLOAT_PARAMS[dt]
+    if value == 0:
+        return dt.type(0.0)
+    negative = value < 0
+    a = -value if negative else value
+    # Midpoint between the largest finite number and infinity; at or above it
+    # the tie-to-even rule overflows (the infinite "mantissa" is even).
+    overflow_at = Fraction(1 << (emax + 1)) - Fraction(1 << (emax - p + 1))
+    if a >= overflow_at:
+        return dt.type(-np.inf if negative else np.inf)
+    # Binary exponent e with 2**e <= a < 2**(e + 1)
+    e = a.numerator.bit_length() - a.denominator.bit_length()
+    while a >= _power_of_two(e + 1):
+        e += 1
+    while a < _power_of_two(e):
+        e -= 1
+    emin = 1 - emax
+    if e < emin:
+        # Subnormal: the unit in the last place is 2**(emin - (p - 1)).
+        scale = p - 1 - emin
+        shifted = a * Fraction(1 << scale)
+        q = shifted.numerator // shifted.denominator
+        r = shifted - q
+        if 2 * r > 1 or (2 * r == 1 and q % 2):
+            q += 1
+        rounded = Fraction(q, 1 << scale)
+    else:
+        scale = p - 1 - e
+        if scale >= 0:
+            shifted = a * Fraction(1 << scale)
+        else:
+            shifted = a / Fraction(1 << -scale)
+        q = shifted.numerator // shifted.denominator
+        r = shifted - q
+        if 2 * r > 1 or (2 * r == 1 and q % 2):
+            q += 1
+        if q == 1 << p:
+            q = 1 << (p - 1)
+            e += 1
+        power = e - (p - 1)
+        if power >= 0:
+            rounded = Fraction(q * (1 << power))
+        else:
+            rounded = Fraction(q, 1 << -power)
+    # ``rounded`` is exactly representable in ``dt`` (and therefore in float64)
+    result = float(rounded)
+    return dt.type(-result if negative else result)
+
+
+_EXACT_FLAG_KEYS = ("nan_r", "pos_r", "neg_r", "nan_i", "pos_i", "neg_i")
+
+
+def _exact_component_sums(cols, finite):
+    """Exact rational sum of the finite entries of each row of ``cols``."""
+    totals = np.empty(cols.shape[0], dtype=object)
+    for i, row in enumerate(cols):
+        total = Fraction(0)
+        for v in row[finite[i]]:
+            total += Fraction(float(v))
+        totals[i] = total
+    return totals
+
+
+def _exact_chunk(
+    x,
+    axis=None,
+    keepdims=False,
+    skipna=False,
+    need_count=False,
+    dtype=None,
+    computing_meta=False,
+):
+    """Chunk step of the exact sum/mean reduction.
+
+    Returns a dict holding, per surviving element: exact rational totals for
+    the real (and imaginary) component, the (non-NaN) element count, and
+    NaN/infinity flags.  Reduced axes are kept with size one.
+    """
+    if computing_meta:
+        return x
+    axis = tuple(axis)
+    x = np.asarray(x)
+    reduced_shape = tuple(1 if i in axis else s for i, s in enumerate(x.shape))
+    dest = tuple(range(x.ndim - len(axis), x.ndim))
+    work = np.moveaxis(x, axis, dest)
+    reduced_sizes = [x.shape[i] for i in axis]
+    kept_sizes = [s for i, s in enumerate(x.shape) if i not in axis]
+    # Products may legitimately be zero for chunks with a zero-length axis.
+    k = int(np.prod(reduced_sizes, dtype=int)) if reduced_sizes else 1
+    m = int(np.prod(kept_sizes, dtype=int)) if kept_sizes else 1
+    cols = np.reshape(work, (m, k))
+    components = (cols.real, cols.imag) if cols.dtype.kind == "c" else (cols,)
+
+    nan_el = np.isnan(cols)
+    if not need_count:
+        n = np.zeros(cols.shape[0], dtype=np.int64)
+    elif skipna:
+        n = (~nan_el).sum(axis=1, dtype=np.int64)
+    else:
+        n = np.full(cols.shape[0], k, dtype=np.int64)
+    state: dict[str, object] = {"n": n.reshape(reduced_shape)}
+
+    for suffix, comp in zip(("_r", "_i"), components):
+        nanmask = np.isnan(comp)
+        infmask = np.isinf(comp)
+        if skipna:
+            # np.nansum replaces a whole complex element (both components)
+            # when either component is NaN, so its infinities vanish too.
+            infmask = infmask & ~nan_el
+        negmask = infmask & np.signbit(comp)
+        posmask = infmask & ~negmask
+        finite = ~(nanmask | infmask)
+        if skipna:
+            finite = finite & ~nan_el
+        totals = _exact_component_sums(comp, finite)
+        state["re" if suffix == "_r" else "im"] = totals.reshape(reduced_shape)
+        nanflag = np.zeros(cols.shape[0], dtype=bool) if skipna else nanmask.any(axis=1)
+        state["nan" + suffix] = nanflag.reshape(reduced_shape)
+        state["pos" + suffix] = posmask.any(axis=1).reshape(reduced_shape)
+        state["neg" + suffix] = negmask.any(axis=1).reshape(reduced_shape)
+    # Real-valued states simply omit the imaginary-component keys.
+    return state
+
+
+def _exact_merge(states, axis):
+    """Merge exact chunk states along ``axis`` (exactly and order-free)."""
+    # ``_concatenate2`` understands the nested state dicts and keeps free axes
+    # aligned when combining several reduced axes at once.
+    joined = _concatenate2(states, axes=axis)
+    merged: dict[str, object] = {}
+    for key in ("re", "im"):
+        if key in joined:
+            # Fraction addition is exact and associative; summation order is
+            # irrelevant.
+            merged[key] = joined[key].sum(axis=axis, dtype=object, keepdims=True)
+    merged["n"] = joined["n"].sum(axis=axis, dtype=np.int64, keepdims=True)
+    for key in _EXACT_FLAG_KEYS:
+        if key in joined:
+            merged[key] = np.any(joined[key], axis=axis, keepdims=True)
+    return merged
+
+
+def _exact_combine(
+    states,
+    axis=None,
+    keepdims=False,
+    skipna=False,
+    need_count=False,
+    dtype=None,
+    computing_meta=False,
+):
+    if computing_meta:
+        return states.sum(axis=axis, keepdims=True)
+    if not isinstance(states, list):
+        states = [states]
+    return _exact_merge(states, axis)
+
+
+def _exact_scalar(total, has_nan, has_pos_inf, has_neg_inf, n, dtype):
+    """Final value of one reduced element of an exact sum/mean."""
+    if has_nan or (has_pos_inf and has_neg_inf):
+        return np.nan
+    if has_pos_inf:
+        return dtype.type(np.inf)
+    if has_neg_inf:
+        return dtype.type(-np.inf)
+    if n is not None:
+        if n == 0:
+            return np.nan
+        total = total / int(n)
+    return _fraction_to_float(total, dtype)
+
+
+def _exact_aggregate(
+    states,
+    axis=None,
+    keepdims=False,
+    skipna=False,
+    need_count=False,
+    dtype=None,
+    computing_meta=False,
+):
+    if computing_meta:
+        result = states.sum(axis=axis, keepdims=True)
+        if not keepdims:
+            result = np.squeeze(result, axis=tuple(axis))
+        return result
+    if not isinstance(states, list):
+        states = [states]
+    state = _exact_merge(states, axis)
+    dt = np.dtype(dtype)
+    shape = state["re"].shape
+    out = np.empty(shape, dtype=dt)
+    target = out.ravel()
+    n = state["n"].ravel() if need_count else [None] * target.size
+    component_specs = [("re", "_r", dt)]
+    if "im" in state:
+        component_dt = np.dtype(np.float32) if dt == np.dtype(np.complex64) else np.dtype(np.float64)
+        component_specs = [("re", "_r", component_dt), ("im", "_i", component_dt)]
+    flags = {key: (state[key].ravel() if key in state else None) for key in _EXACT_FLAG_KEYS}
+    for i in range(target.size):
+        values = []
+        for total_key, suffix, component_dt in component_specs:
+            total = state[total_key].ravel()[i]
+            values.append(
+                _exact_scalar(
+                    total,
+                    flags["nan" + suffix][i],
+                    flags["pos" + suffix][i],
+                    flags["neg" + suffix][i],
+                    n[i],
+                    component_dt,
+                )
+            )
+        target[i] = values[0] if len(component_specs) == 1 else complex(*values)
+    if not keepdims:
+        out = np.squeeze(out, axis=tuple(axis))
+    return out
+
+
+_EXACT_OUTPUT_DTYPES = frozenset(
+    map(
+        np.dtype,
+        (
+            np.float16,
+            np.float32,
+            np.float64,
+            np.complex64,
+            np.complex128,
+        ),
+    )
+)
+
+
+def _validate_exact_reduction(a, dtype):
+    meta = getattr(a, "_meta", None)
+    if type(meta) is not np.ndarray:
+        # Covers CuPy/sparse chunks as well as NumPy subclasses like masked
+        # arrays, whose masks would be silently lost.
+        raise TypeError(
+            "exact=True is only supported for arrays with plain NumPy ndarray "
+            f"chunks; got {type(meta).__name__}. Retry with exact=False to use "
+            "the ordinary reduction."
+        )
+    if a.dtype.kind not in "fc":
+        raise TypeError(
+            "exact=True is only supported for floating-point and complex data "
+            f"(got dtype {a.dtype}); integer arithmetic is already associative "
+            "and exact. Retry with exact=False to use the ordinary reduction."
+        )
+    dt = np.dtype(dtype)
+    if dt not in _EXACT_OUTPUT_DTYPES:
+        raise TypeError(
+            "exact=True can only produce binary16/binary32/binary64 floating "
+            f"point or complex64/complex128 output (got dtype {dt}). Retry "
+            "with exact=False to use the ordinary reduction."
+        )
+    if a.dtype.kind == "c" and dt.kind == "f":
+        raise TypeError("can't convert complex to float")
+
+
+def _exact_reduction(a, axis, keepdims, dtype, split_every, out, skipna, need_count, name):
+    return reduction(
+        a,
+        partial(_exact_chunk, skipna=skipna, need_count=need_count),
+        partial(_exact_aggregate, skipna=skipna, need_count=need_count),
+        combine=partial(_exact_combine, skipna=skipna, need_count=need_count),
+        axis=axis,
+        keepdims=keepdims,
+        dtype=dtype,
+        split_every=split_every,
+        out=out,
+        concatenate=False,
+        name=name,
+    )
+
+
 @derived_from(np)
-def sum(a, axis=None, dtype=None, keepdims=False, split_every=None, out=None):
+def sum(a, axis=None, dtype=None, keepdims=False, split_every=None, out=None, *, exact=False):
+    """Dask added an additional keyword-only argument ``exact``.
+
+    exact : bool, optional
+        If True, reduce floating-point and complex data using exact rational
+        arithmetic and perform a single correctly rounded
+        (round-to-nearest, ties-to-even) conversion to the output dtype.  The
+        result is independent of chunking, ``split_every`` and task execution
+        order.  Only supported for NumPy-backed floating-point and complex
+        arrays; for unsupported inputs a ``TypeError`` is raised while building
+        the graph and the ordinary call with ``exact=False`` remains available.
+        Integer inputs use the ordinary reduction.  Default is False.
+    """
     if dtype is None:
         dtype = getattr(np.zeros(1, dtype=a.dtype).sum(), "dtype", object)
+    if exact:
+        if a.dtype.kind in "biu":
+            exact = False
+        else:
+            _validate_exact_reduction(a, dtype)
+            return _exact_reduction(
+                a,
+                axis,
+                keepdims,
+                dtype,
+                split_every,
+                out,
+                skipna=False,
+                need_count=False,
+                name="exact-sum",
+            )
     result = reduction(
         a,
         chunk.sum,
@@ -178,11 +516,31 @@ def all(a, axis=None, keepdims=False, split_every=None, out=None):
 
 
 @derived_from(np)
-def nansum(a, axis=None, dtype=None, keepdims=False, split_every=None, out=None):
+def nansum(a, axis=None, dtype=None, keepdims=False, split_every=None, out=None, *, exact=False):
+    """Dask added an additional keyword-only argument ``exact``; see
+    :func:`dask.array.sum` for its semantics. NaN values are skipped exactly as
+    with ``exact=False``.
+    """
     if dtype is not None:
         dt = dtype
     else:
         dt = getattr(chunk.nansum(np.ones((1,), dtype=a.dtype)), "dtype", object)
+    if exact:
+        if a.dtype.kind in "biu":
+            exact = False
+        else:
+            _validate_exact_reduction(a, dt)
+            return _exact_reduction(
+                a,
+                axis,
+                keepdims,
+                dt,
+                split_every,
+                out,
+                skipna=True,
+                need_count=False,
+                name="exact-nansum",
+            )
     return reduction(
         a,
         chunk.nansum,
@@ -383,13 +741,33 @@ def mean_agg(pairs, dtype="f8", axis=None, computing_meta=False, **kwargs):
 
 
 @derived_from(np)
-def mean(a, axis=None, dtype=None, keepdims=False, split_every=None, out=None):
+def mean(a, axis=None, dtype=None, keepdims=False, split_every=None, out=None, *, exact=False):
+    """Dask added an additional keyword-only argument ``exact``; see
+    :func:`dask.array.sum`. The exact mean divides the exact sum by the exact
+    element count and performs a single correctly rounded division.
+    """
     if dtype is not None:
         dt = dtype
     elif a.dtype == object:
         dt = object
     else:
         dt = getattr(np.mean(np.zeros(shape=(1,), dtype=a.dtype)), "dtype", object)
+    if exact:
+        if a.dtype.kind in "biu":
+            exact = False
+        else:
+            _validate_exact_reduction(a, dt)
+            return _exact_reduction(
+                a,
+                axis,
+                keepdims,
+                dt,
+                split_every,
+                out,
+                skipna=False,
+                need_count=True,
+                name="exact-mean",
+            )
     return reduction(
         a,
         mean_chunk,
@@ -405,11 +783,31 @@ def mean(a, axis=None, dtype=None, keepdims=False, split_every=None, out=None):
 
 
 @derived_from(np)
-def nanmean(a, axis=None, dtype=None, keepdims=False, split_every=None, out=None):
+def nanmean(a, axis=None, dtype=None, keepdims=False, split_every=None, out=None, *, exact=False):
+    """Dask added an additional keyword-only argument ``exact``; see
+    :func:`dask.array.sum` for its semantics. NaN values are ignored when
+    counting and summing, exactly as with ``exact=False``.
+    """
     if dtype is not None:
         dt = dtype
     else:
         dt = getattr(np.mean(np.ones(shape=(1,), dtype=a.dtype)), "dtype", object)
+    if exact:
+        if a.dtype.kind in "biu":
+            exact = False
+        else:
+            _validate_exact_reduction(a, dt)
+            return _exact_reduction(
+                a,
+                axis,
+                keepdims,
+                dt,
+                split_every,
+                out,
+                skipna=True,
+                need_count=True,
+                name="exact-nanmean",
+            )
     return reduction(
         a,
         partial(mean_chunk, sum=chunk.nansum, numel=nannumel),

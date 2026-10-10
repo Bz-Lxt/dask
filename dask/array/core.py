@@ -2586,7 +2586,16 @@ class Array(DaskMethodsMixin):
             self, axis=axis, keepdims=keepdims, split_every=split_every, out=out
         )
 
-    def sum(self, axis=None, dtype=None, keepdims=False, split_every=None, out=None):
+    def sum(
+        self,
+        axis=None,
+        dtype=None,
+        keepdims=False,
+        split_every=None,
+        out=None,
+        *,
+        exact=False,
+    ):
         """
         Return the sum of the array elements over the given axis.
 
@@ -2605,6 +2614,7 @@ class Array(DaskMethodsMixin):
             keepdims=keepdims,
             split_every=split_every,
             out=out,
+            exact=exact,
         )
 
     def trace(self, offset=0, axis1=0, axis2=1, dtype=None):
@@ -2640,7 +2650,16 @@ class Array(DaskMethodsMixin):
             out=out,
         )
 
-    def mean(self, axis=None, dtype=None, keepdims=False, split_every=None, out=None):
+    def mean(
+        self,
+        axis=None,
+        dtype=None,
+        keepdims=False,
+        split_every=None,
+        out=None,
+        *,
+        exact=False,
+    ):
         """Returns the average of the array elements along given axis.
 
         Refer to :func:`dask.array.mean` for full documentation.
@@ -2658,6 +2677,7 @@ class Array(DaskMethodsMixin):
             keepdims=keepdims,
             split_every=split_every,
             out=out,
+            exact=exact,
         )
 
     def std(

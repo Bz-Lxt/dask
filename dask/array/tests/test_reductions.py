@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import math
 import os
 import warnings
 from contextlib import nullcontext as does_not_warn
+from fractions import Fraction
 from itertools import permutations, zip_longest
 
 import pytest
@@ -1260,3 +1262,271 @@ def test_nanquantile_two_dims():
     assert_eq(
         da.nanpercentile(darr, 0.75, axis=-1), np.nanpercentile(arr, 0.75, axis=-1)
     )
+
+
+# --------------------------------------------------------------------------
+# Exact, chunking-independent reductions (exact=True)
+# --------------------------------------------------------------------------
+
+
+def _reduced_columns(x, axis):
+    """Reshape ``x`` so every reduced slice is a row (columns of the result)."""
+    ndim = x.ndim
+    if axis is None:
+        axis = tuple(range(ndim))
+    elif isinstance(axis, int):
+        axis = (axis,)
+    axis = tuple(ax % ndim for ax in axis)
+    work = np.moveaxis(x, axis, tuple(range(ndim - len(axis), ndim)))
+    reduced_sizes = [x.shape[i] for i in axis]
+    kept_shape = tuple(s for i, s in enumerate(x.shape) if i not in axis)
+    k = int(np.prod(reduced_sizes, dtype=int)) if reduced_sizes else 1
+    m = int(np.prod(kept_shape, dtype=int)) if kept_shape else 1
+    return work.reshape(m, k), axis
+
+
+def _fsum_reference(x, axis=None, keepdims=False):
+    """Correctly rounded reference using ``math.fsum`` (float64/complex128)."""
+    cols, axis = _reduced_columns(x, axis)
+    if cols.dtype.kind == "c":
+        values = [
+            complex(math.fsum(col.real.tolist()), math.fsum(col.imag.tolist()))
+            for col in cols
+        ]
+    else:
+        values = [math.fsum(col.tolist()) for col in cols]
+    out = np.array(values, dtype=x.dtype).reshape(
+        tuple(1 if i in axis else x.shape[i] for i in range(x.ndim))
+    )
+    if not keepdims:
+        out = np.squeeze(out, axis=axis)
+    return out
+
+
+def _fraction_mean_reference(x, axis=None, keepdims=False):
+    cols, axis = _reduced_columns(x, axis)
+    values = []
+    for col in cols:
+        total = sum((Fraction(float(v)) for v in col), Fraction(0))
+        values.append(float(total / col.size))
+    out = np.array(values, dtype=x.dtype).reshape(
+        tuple(1 if i in axis else x.shape[i] for i in range(x.ndim))
+    )
+    if not keepdims:
+        out = np.squeeze(out, axis=axis)
+    return out
+
+
+@pytest.mark.normal_and_array_expr
+@pytest.mark.parametrize("axis", [None, 0, 1, 2, (0, 2), (1, 2), (0, 1, 2)])
+@pytest.mark.parametrize("keepdims", [False, True])
+def test_exact_sum_reference_f64(axis, keepdims):
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(6, 7, 8))
+    d = da.from_array(x, chunks=(2, 3, 4))
+    assert_eq(
+        da.sum(d, axis=axis, keepdims=keepdims, exact=True),
+        _fsum_reference(x, axis, keepdims),
+    )
+
+
+@pytest.mark.normal_and_array_expr
+@pytest.mark.parametrize("axis", [None, 0, 1, (0, 1)])
+@pytest.mark.parametrize("keepdims", [False, True])
+def test_exact_sum_reference_complex(axis, keepdims):
+    rng = np.random.default_rng(1)
+    x = rng.normal(size=(6, 7)) + 1j * rng.normal(size=(6, 7))
+    d = da.from_array(x, chunks=(2, 3))
+    assert_eq(
+        da.sum(d, axis=axis, keepdims=keepdims, exact=True),
+        _fsum_reference(x, axis, keepdims),
+    )
+
+
+@pytest.mark.normal_and_array_expr
+@pytest.mark.parametrize("axis", [None, 0, 1, 2, (0, 2)])
+@pytest.mark.parametrize("keepdims", [False, True])
+def test_exact_mean_reference(axis, keepdims):
+    rng = np.random.default_rng(2)
+    x = rng.normal(size=(6, 7, 8))
+    d = da.from_array(x, chunks=(2, 3, 4))
+    assert_eq(
+        da.mean(d, axis=axis, keepdims=keepdims, exact=True),
+        _fraction_mean_reference(x, axis, keepdims),
+    )
+
+
+@pytest.mark.normal_and_array_expr
+@pytest.mark.parametrize("dtype", ["f2", "f4", "f8", "c8", "c16"])
+@pytest.mark.parametrize("funcname", ["sum", "nansum", "mean", "nanmean"])
+@pytest.mark.parametrize("axis", [None, 0, 1, (0, 2)])
+def test_exact_reductions_are_chunk_independent(dtype, funcname, axis):
+    rng = np.random.default_rng(3)
+    x = rng.normal(size=(6, 7, 8))
+    if dtype.startswith("c"):
+        x = x + 1j * rng.normal(size=(6, 7, 8))
+    x = x.astype(dtype)
+    func = getattr(da, funcname)
+    chunkings = [(2, 3, 4), (6, 7, 8), (3, 1, 5), (4, 2, 3)]
+    results = [
+        func(da.from_array(x, chunks=chunks), axis=axis, exact=True).compute()
+        for chunks in chunkings
+    ]
+    for other in results[1:]:
+        np.testing.assert_array_equal(results[0], other)
+    # The tree width must not matter either.
+    shallow = func(
+        da.from_array(x, chunks=(2, 3, 4)), axis=axis, split_every=8, exact=True
+    ).compute()
+    deep = func(
+        da.from_array(x, chunks=(2, 3, 4)), axis=axis, split_every=2, exact=True
+    ).compute()
+    np.testing.assert_array_equal(shallow, deep)
+
+
+@pytest.mark.normal_and_array_expr
+def test_exact_sum_dtype_semantics():
+    rng = np.random.default_rng(4)
+    x32 = rng.normal(size=100).astype(np.float32)
+    d = da.from_array(x32, chunks=7)
+    assert da.sum(d, exact=True).compute().dtype == np.float32
+    assert da.mean(d, exact=True).compute().dtype == np.float32
+    promoted = da.sum(d, dtype="f8", exact=True).compute()
+    assert promoted.dtype == np.float64
+    assert promoted == math.fsum(x32.tolist())
+    z64 = (rng.normal(size=20) + 1j * rng.normal(size=20)).astype(np.complex64)
+    assert da.sum(da.from_array(z64, chunks=4), exact=True).compute().dtype == np.complex64
+
+
+@pytest.mark.normal_and_array_expr
+def test_exact_reductions_nan_and_inf():
+    y = np.array([1.0, np.nan, 2.0, np.inf, -np.inf, 3.0])
+    d = da.from_array(y, chunks=2)
+    assert np.isnan(da.sum(d, exact=True).compute())
+    assert np.isnan(da.mean(d, exact=True).compute())
+    # NaN skipped, but +inf and -inf still cancel to NaN
+    assert np.isnan(da.nansum(d, exact=True).compute())
+    assert np.isnan(da.nanmean(d, exact=True).compute())
+
+    clean = np.array([1.0, np.nan, 2.0, 3.0])
+    dc = da.from_array(clean, chunks=2)
+    assert da.nansum(dc, exact=True).compute() == 6.0
+    assert da.nanmean(dc, exact=True).compute() == 2.0
+
+    infs = np.array([np.inf, 1.0, np.nan])
+    di = da.from_array(infs, chunks=2)
+    assert da.nansum(di, exact=True).compute() == np.inf
+    assert da.nanmean(di, exact=True).compute() == np.inf
+
+    z = np.array([1 + 2j, complex(np.nan, 3.0), 4 + 0j], dtype=np.complex128)
+    dz = da.from_array(z, chunks=2)
+    # Plain propagation is componentwise
+    propagated = da.sum(dz, exact=True).compute()
+    assert np.isnan(propagated.real) and propagated.imag == 5.0
+    # nansum drops the whole NaN element, matching np.nansum
+    got = da.nansum(dz, exact=True).compute()
+    assert got == np.nansum(z) == (5 + 2j)
+    assert da.nanmean(dz, exact=True).compute() == np.nanmean(z)
+
+    # Axis-wise flags
+    x = np.array([[1.0, np.nan], [np.inf, 2.0]])
+    dx = da.from_array(x, chunks=(1, 1))
+    np.testing.assert_array_equal(
+        da.nansum(dx, axis=0, exact=True).compute(), [np.inf, 2.0]
+    )
+
+
+@pytest.mark.normal_and_array_expr
+def test_exact_reductions_empty():
+    empty = da.from_array(np.zeros((0,), "f8"), chunks=())
+    assert da.sum(empty, exact=True).compute() == 0.0
+    assert da.nansum(empty, exact=True).compute() == 0.0
+    assert np.isnan(da.mean(empty, exact=True).compute())
+    assert np.isnan(da.nanmean(empty, exact=True).compute())
+    assert da.sum(empty, exact=True, keepdims=True).compute().shape == (1,)
+
+    x = da.from_array(np.zeros((0, 4), "f8"), chunks=(0, 4))
+    np.testing.assert_array_equal(da.sum(x, axis=0, exact=True).compute(), np.zeros(4))
+    assert np.all(np.isnan(da.mean(x, axis=0, exact=True).compute()))
+    assert da.sum(x, axis=1, exact=True).compute().shape == (0,)
+
+    all_nan = da.from_array(np.full(3, np.nan), chunks=2)
+    assert da.nansum(all_nan, exact=True).compute() == 0.0
+    assert np.isnan(da.nanmean(all_nan, exact=True).compute())
+
+
+@pytest.mark.normal_and_array_expr
+def test_exact_reductions_integer_fallback_and_errors():
+    x = da.from_array(np.arange(6).reshape(2, 3), chunks=2)
+    # Integer arithmetic is already order-independent; exact=True is a no-op.
+    assert_eq(da.sum(x, exact=True), da.sum(x))
+    assert_eq(da.mean(x, exact=True), da.mean(x))
+    assert x.sum(exact=True).compute() == 15
+    assert x.mean(exact=True).compute() == 2.5
+
+    with pytest.raises(TypeError, match="floating-point and complex"):
+        da.sum(da.from_array(np.array([object()], object), chunks=1), exact=True)
+    # Masked arrays keep their mask outside of ndarray semantics
+    masked = da.from_array(np.ma.array([1.0, 2.0], mask=[0, 1]), chunks=1)
+    with pytest.raises(TypeError, match="plain NumPy"):
+        da.sum(masked, exact=True)
+    rng = np.random.default_rng(5)
+    z = rng.normal(size=4) + 1j * rng.normal(size=4)
+    with pytest.raises(TypeError, match="complex"):
+        da.sum(da.from_array(z, chunks=2), exact=True, dtype="f8")
+    with pytest.raises(TypeError, match="dtype"):
+        da.sum(da.from_array(rng.normal(size=4), chunks=2), exact=True, dtype="i8")
+
+
+@pytest.mark.normal_and_array_expr
+def test_exact_reductions_lazy_out_and_methods():
+    rng = np.random.default_rng(6)
+    x = rng.normal(size=(6, 7, 8))
+    d = da.from_array(x, chunks=3)
+    # Graph construction never materializes data
+    lazy = da.sum(d, exact=True)
+    assert isinstance(lazy, da.Array)
+    total = math.fsum(x.ravel().tolist())
+    assert lazy.compute() == total
+    assert d.sum(exact=True).compute() == total
+    assert d.mean(exact=True).compute() == float(
+        sum((Fraction(float(v)) for v in x.ravel()), Fraction(0)) / x.size
+    )
+
+    out = da.zeros((), dtype="f8", chunks=())
+    result = da.sum(d, out=out, exact=True)
+    assert result.compute() == total
+    # The rejected/ordinary path still builds and computes independently
+    ordinary = da.sum(d)
+    assert isinstance(ordinary, da.Array)
+    ordinary.compute()
+
+
+@pytest.mark.normal_and_array_expr
+def test_fraction_to_float_rounding():
+    from dask.array.reductions import _fraction_to_float as round_fraction
+
+    assert round_fraction(Fraction(0), "f8") == 0.0
+    assert round_fraction(Fraction(1, 10), "f4") == np.float32(0.1)
+
+    # Exact ties resolve to even mantissa at every precision
+    tie32 = Fraction(1) + Fraction(1, 1 << 24)
+    assert round_fraction(tie32, "f4") == np.float32(1.0)
+    assert round_fraction(tie32 + Fraction(1, 1 << 30), "f4") > np.float32(1.0)
+    assert round_fraction(Fraction(1) + Fraction(1, 1 << 11), "f2") == np.float16(1.0)
+
+    # Double rounding (f64 then f32) would pick the wrong side here, but the
+    # direct rounding must not:
+    trap32 = Fraction(1) + Fraction(1, 1 << 24) + Fraction(1, 1 << 53)
+    assert round_fraction(trap32, "f4") == np.float32(1.0) + np.finfo(np.float32).eps
+
+    # Smallest subnormals and their zero ties
+    assert round_fraction(Fraction(1, 1 << 1075), "f8") == 0.0
+    assert round_fraction(Fraction(3, 1 << 1076), "f8") == np.float64(2.0**-1074)
+    assert round_fraction(Fraction(1, 1 << 25), "f2") == np.float16(0.0)
+    assert round_fraction(Fraction(3, 1 << 26), "f2") == np.float16(2.0**-24)
+
+    # Overflow
+    assert round_fraction(Fraction(1 << 1024), "f8") == np.inf
+    assert round_fraction(-Fraction(1 << 1024), "f8") == -np.inf
+    assert round_fraction(Fraction(1 << 1023), "f8") == np.float64(2.0**1023)
