@@ -11,6 +11,25 @@ properties:
       When the value is "null" (default), dask will create a directory from
       where dask was launched: `cwd/dask-worker-space`
 
+  multiprocessing:
+    type: object
+    properties:
+      share-inputs:
+        type:
+          - boolean
+        description: |
+          If ``true``, the multiprocessing scheduler places large read-only
+          array inputs in shared memory once instead of pickling them for
+          every task.
+      shared-input-min-bytes:
+        type:
+          - integer
+          - number
+        minimum: 0
+        description: |
+          Minimum size in bytes of an array input for it to be placed in
+          shared memory when ``multiprocessing.share-inputs`` is ``true``.
+
   visualization:
     type: object
     properties:

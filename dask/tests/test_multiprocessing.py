@@ -4,13 +4,22 @@ import multiprocessing
 import pickle
 import sys
 from concurrent.futures import ProcessPoolExecutor
+from multiprocessing.shared_memory import SharedMemory
 from operator import add
 
 import pytest
 
 import dask
 from dask import compute, delayed
-from dask.multiprocessing import _dumps, _loads, get, get_context, remote_exception
+from dask.multiprocessing import (
+    _dumps,
+    _loads,
+    _SharedArray,
+    get,
+    get_context,
+    remote_exception,
+    share_graph_inputs,
+)
 from dask.system import CPU_COUNT
 from dask.utils_test import inc
 
@@ -304,3 +313,204 @@ def test_get_context_always_default():
     with pytest.warns(UserWarning):
         with dask.config.set({"multiprocessing.context": "forkserver"}):
             assert get_context() is multiprocessing
+
+
+# -- Shared read-only input storage ---------------------------------------
+
+np = pytest.importorskip("numpy")
+
+
+def _big_array():
+    return np.arange(500_000, dtype=np.float64)  # 4 MB
+
+
+def _sum_all(x):
+    return float(x.sum())
+
+
+def _sum_strided(x):
+    return float(x[::2].sum())
+
+
+def _sum_nested(payload):
+    lst, tup, dct = payload
+    return float(lst.sum() + tup[0][1::3].sum() + dct["k"].sum())
+
+
+def _mutate_input(x):
+    x[0] = -1
+    return float(x.sum())
+
+
+def _bad_with_arg(x):
+    raise ValueError("12345")
+
+
+def _raise_keyboard_interrupt(x):
+    raise KeyboardInterrupt
+
+
+def _count_attachments(x):
+    from dask import multiprocessing as dmp
+
+    return float(x.sum()), len(dmp._SHARED_ATTACHMENTS)
+
+
+_recorded_payload_sizes: list[int] = []
+
+
+def _recording_dumps(obj):
+    payload = _dumps(obj)
+    _recorded_payload_sizes.append(len(payload))
+    return payload
+
+
+def test_share_graph_inputs_selection():
+    big = _big_array()
+    small = np.arange(3, dtype=np.float64)
+    obj = np.empty(2, dtype=object)
+
+    dsk = {
+        "big": big,
+        "small": small,
+        "obj": obj,
+        "task": (_sum_all, big),
+        "nested": [big, {"k": (_sum_all, big)}],
+    }
+    shared, manager = share_graph_inputs(dsk, min_bytes=1_048_576)
+    try:
+        assert isinstance(shared["big"], _SharedArray)
+        # Arrays below the threshold and object arrays are left untouched
+        assert shared["small"] is small
+        assert shared["obj"] is obj
+        # Handles are threaded into tasks and nested containers
+        assert isinstance(shared["task"][1], _SharedArray)
+        assert isinstance(shared["nested"][0], _SharedArray)
+        assert isinstance(shared["nested"][1]["k"][1], _SharedArray)
+        # The same array is shared into a single segment
+        assert len(manager.names) == 1
+    finally:
+        manager.close()
+
+
+def test_shared_inputs_values():
+    big = _big_array()
+    # Non-contiguous (strided) view of a 2-D array
+    strided = big.reshape(500, 1000)[::2]
+
+    dsk = {
+        "big": big,
+        "strided": strided,
+        "full": (_sum_all, "big"),
+        "sliced": (_sum_strided, "strided"),
+        # Literal arrays nested in list/tuple/dict arguments
+        "nested": (_sum_nested, [big, (strided,), {"k": big}]),
+    }
+    results = get(
+        dsk, ["full", "sliced", "nested"], share_inputs=True, num_workers=2
+    )
+    expected = (
+        float(big.sum()),
+        float(strided[::2].sum()),
+        float(big.sum() + strided[1::3].sum() + big.sum()),
+    )
+    assert results == expected
+
+
+def test_shared_inputs_single_transfer():
+    big = _big_array()
+    dsk = {
+        "big": big,
+        "r1": (_sum_all, "big"),
+        "r2": (_sum_all, "big"),
+    }
+
+    _recorded_payload_sizes.clear()
+    results = get(
+        dsk,
+        ["r1", "r2"],
+        share_inputs=True,
+        num_workers=2,
+        chunksize=1,
+        func_dumps=_recording_dumps,
+    )
+    assert results == (float(big.sum()),) * 2
+    # The 4 MB array must never travel with a task payload
+    assert max(_recorded_payload_sizes) < big.nbytes // 10
+
+    _recorded_payload_sizes.clear()
+    get(
+        dsk,
+        ["r1", "r2"],
+        share_inputs=False,
+        num_workers=2,
+        chunksize=1,
+        func_dumps=_recording_dumps,
+    )
+    assert max(_recorded_payload_sizes) >= big.nbytes
+
+
+def test_shared_inputs_readonly():
+    big = _big_array()
+    dsk = {"big": big, "r": (_mutate_input, "big")}
+    with pytest.raises(ValueError, match="read-only"):
+        get(dsk, "r", share_inputs=True, num_workers=1)
+
+
+def test_shared_inputs_config():
+    big = _big_array()
+    dsk = {"big": big, "r": (_sum_all, "big")}
+    with dask.config.set({"multiprocessing.share-inputs": True}):
+        assert get(dsk, "r", num_workers=1) == float(big.sum())
+
+
+def test_shared_inputs_cleanup_after_failure():
+    big = _big_array()
+    dsk = {"big": big, "r": (_bad_with_arg, "big")}
+    shared, manager = share_graph_inputs(dsk, min_bytes=1_048_576)
+    name = manager.names[0]
+    try:
+        with pytest.raises(ValueError, match="12345"):
+            get(shared, "r", num_workers=1)
+    finally:
+        manager.close()
+        manager.close()  # closing twice must not raise
+    # The segment was unlinked and cannot be reattached
+    with pytest.raises(FileNotFoundError):
+        SharedMemory(name=name, create=False)
+
+
+def test_shared_inputs_cleanup_after_interrupt():
+    big = _big_array()
+    dsk = {"big": big, "r": (_raise_keyboard_interrupt, "big")}
+    shared, manager = share_graph_inputs(dsk, min_bytes=1_048_576)
+    name = manager.names[0]
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            get(shared, "r", num_workers=1)
+    finally:
+        manager.close()
+    with pytest.raises(FileNotFoundError):
+        SharedMemory(name=name, create=False)
+
+
+def test_shared_inputs_followup_compute_unaffected():
+    big = _big_array()
+    dsk = {"big": big, "r": (_bad_with_arg, "big")}
+    with pytest.raises(ValueError, match="12345"):
+        get(dsk, "r", share_inputs=True, num_workers=1)
+
+    # A later successful computation is unaffected by the failed one
+    other = _big_array() + 1
+    dsk2 = {"other": other, "r": (_sum_all, "other")}
+    assert get(dsk2, "r", share_inputs=True, num_workers=1) == float(other.sum())
+
+
+def test_shared_inputs_attachment_cached_per_worker():
+    big = _big_array()
+    keys = [f"r{i}" for i in range(8)]
+    dsk = {"big": big, **{key: (_count_attachments, "big") for key in keys}}
+    results = get(dsk, keys, share_inputs=True, num_workers=1, chunksize=1)
+    assert [value for value, _ in results] == [float(big.sum())] * 8
+    # One segment attachment per worker, no matter how many tasks read it
+    assert all(n_attachments == 1 for _, n_attachments in results)

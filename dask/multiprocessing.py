@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import copyreg
 import multiprocessing
 import multiprocessing.pool
@@ -10,11 +11,14 @@ import traceback
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
+from multiprocessing.shared_memory import SharedMemory
 from warnings import warn
 
 import cloudpickle
+import numpy as np
 
 from dask import config
+from dask.core import istask
 from dask.local import MultiprocessingPoolExecutor, get_async, reraise
 from dask.optimization import cull, fuse
 from dask.system import CPU_COUNT
@@ -144,6 +148,165 @@ def get_context():
         return multiprocessing.get_context(context_name)
 
 
+# -- Shared read-only input storage ----------------------------------------
+#
+# When several tasks read the same large input array, pickling the array
+# with every task submission copies it to the workers once per task.
+# Optionally (see the ``multiprocessing.share-inputs`` config), such inputs
+# are instead copied once into a ``SharedMemory`` segment in the scheduler
+# process; tasks are sent a small handle and workers attach to the segment
+# zero-copy, reconstructing a read-only ``numpy.ndarray``. This preserves the
+# numerical semantics of both slicing (views) and inputs nested inside
+# tuples/lists/dicts. The scheduler process owns the segments and unlinks
+# them only after the worker pool has shut down (on success, task failure,
+# or interrupt), so workers never outlive the storage they read.
+
+
+class _SharedArray:
+    """Scheduler-side placeholder for an array stored in shared memory.
+
+    Pickles to a lightweight handle (never the array data); on unpickling in
+    a worker process it is reconstructed by :func:`_reconstruct_shared_array`
+    as a read-only ``numpy.ndarray`` backed by the shared segment.
+    """
+
+    def __init__(self, name: str, shape: tuple[int, ...], dtype: str, nbytes: int):
+        self.name = name
+        self.shape = shape
+        self.dtype = dtype
+        self.nbytes = nbytes
+
+    def __reduce__(self):
+        return (
+            _reconstruct_shared_array,
+            (self.name, self.shape, self.dtype, self.nbytes),
+        )
+
+
+# Per-worker-process cache of attached segments, so that a segment used by
+# many tasks in the same worker is attached once rather than per task.
+_SHARED_ATTACHMENTS: dict[str, SharedMemory] = {}
+_atexit_registered = False
+
+
+def _reconstruct_shared_array(name, shape, dtype, nbytes):
+    """Reattach to a shared input segment in a worker process.
+
+    Returns a read-only ``numpy.ndarray`` view on the shared memory. The
+    underlying segment attachment is cached for the lifetime of the worker
+    process and released at exit; it is never unlinked here (the scheduler
+    process owns unlinking).
+    """
+    global _atexit_registered
+    shm = _SHARED_ATTACHMENTS.get(name)
+    if shm is None:
+        shm = SharedMemory(name=name, create=False)
+        _SHARED_ATTACHMENTS[name] = shm
+        if not _atexit_registered:
+            atexit.register(_release_shared_attachments)
+            _atexit_registered = True
+    arr = np.ndarray(shape, dtype=np.dtype(dtype), buffer=shm.buf)
+    assert arr.nbytes == nbytes
+    arr.setflags(write=False)
+    return arr
+
+
+def _release_shared_attachments():
+    """Close (but do not unlink) this process's shared segment attachments."""
+    for shm in _SHARED_ATTACHMENTS.values():
+        try:
+            shm.close()
+        except (FileNotFoundError, BufferError):
+            pass
+    _SHARED_ATTACHMENTS.clear()
+
+
+class _SharedInputManager:
+    """Owns the shared memory segments created for one ``get`` call."""
+
+    def __init__(self, min_bytes: int):
+        self.min_bytes = min_bytes
+        self._segments: dict[str, SharedMemory] = {}
+        self._arrays: dict[int, _SharedArray] = {}
+
+    @property
+    def names(self) -> list[str]:
+        return list(self._segments)
+
+    def share_value(self, value):
+        """Return a copy of ``value`` with eligible arrays replaced by handles."""
+        if isinstance(value, np.ndarray):
+            return self._share_array(value)
+        if istask(value):
+            return (value[0],) + tuple(self.share_value(a) for a in value[1:])
+        if type(value) is list:
+            return [self.share_value(v) for v in value]
+        if type(value) is tuple:
+            return tuple(self.share_value(v) for v in value)
+        if type(value) is dict:
+            return {k: self.share_value(v) for k, v in value.items()}
+        if type(value) is set:
+            return {self.share_value(v) for v in value}
+        return value
+
+    def _share_array(self, arr: np.ndarray):
+        dtype = arr.dtype
+        # Object/void arrays cannot live in a flat shared segment, and
+        # empty or small arrays are not worth sharing.
+        if (
+            dtype.hasobject
+            or dtype.kind == "V"
+            or arr.nbytes == 0
+            or arr.nbytes < self.min_bytes
+        ):
+            return arr
+        handle = self._arrays.get(id(arr))
+        if handle is not None:
+            return handle
+        data = arr if arr.flags.c_contiguous else np.ascontiguousarray(arr)
+        shm = SharedMemory(create=True, size=data.nbytes)
+        try:
+            np.ndarray(data.shape, dtype=data.dtype, buffer=shm.buf)[...] = data
+        except BaseException:
+            shm.close()
+            shm.unlink()
+            raise
+        self._segments[shm.name] = shm
+        handle = _SharedArray(shm.name, data.shape, data.dtype.str, data.nbytes)
+        self._arrays[id(arr)] = handle
+        return handle
+
+    def close(self) -> None:
+        """Close and unlink all segments. Safe to call more than once."""
+        for shm in self._segments.values():
+            try:
+                shm.close()
+            except (FileNotFoundError, BufferError):
+                pass
+            try:
+                shm.unlink()
+            except FileNotFoundError:
+                pass
+        self._segments.clear()
+        self._arrays.clear()
+
+
+def share_graph_inputs(dsk: Mapping, min_bytes: int):
+    """Replace shareable array inputs in ``dsk`` with shared-memory handles.
+
+    Returns the rewritten graph together with the :class:`_SharedInputManager`
+    that owns the backing segments. ``manager.close()`` must be called once
+    all tasks are finished.
+    """
+    manager = _SharedInputManager(min_bytes)
+    try:
+        shared = {key: manager.share_value(value) for key, value in dsk.items()}
+    except BaseException:
+        manager.close()
+        raise
+    return shared, manager
+
+
 def get(
     dsk: Mapping,
     keys: Sequence[Key] | Key,
@@ -154,6 +317,7 @@ def get(
     pool=None,
     initializer=None,
     chunksize=None,
+    share_inputs=None,
     **kwargs,
 ):
     """Multiprocessed get function appropriate for Bags
@@ -181,11 +345,24 @@ def get(
         Size of chunks to use when dispatching work.
         Defaults to 6 as some batching is helpful.
         If -1, will be computed to evenly divide ready work across workers.
+    share_inputs: bool, optional
+        If True, large read-only array inputs in the graph are placed in
+        shared memory once instead of being pickled for every task. Defaults
+        to the ``multiprocessing.share-inputs`` configuration (``False``).
+        Arrays smaller than ``multiprocessing.shared-input-min-bytes`` are
+        not shared.
     """
     chunksize = chunksize or config.get("chunksize", 6)
     pool = pool or config.get("pool", None)
     initializer = initializer or config.get("multiprocessing.initializer", None)
     num_workers = num_workers or config.get("num_workers", None) or CPU_COUNT
+    if share_inputs is None:
+        share_inputs = config.get("multiprocessing.share-inputs", False)
+    # Re-running failed tasks locally would pass the shared-array handles
+    # (rather than real arrays) to the task, so sharing is incompatible with
+    # ``rerun_exceptions_locally``.
+    if share_inputs and config.get("rerun_exceptions_locally", False):
+        share_inputs = False
     if pool is None:
         # In order to get consistent hashing in subprocesses, we need to set a
         # consistent seed for the Python hash algorithm. Unfortunately, there
@@ -228,10 +405,15 @@ def get(
     loads = func_loads or config.get("func_loads", None) or _loads
     dumps = func_dumps or config.get("func_dumps", None) or _dumps
 
+    shared_inputs = None
+
     # Note former versions used a multiprocessing Manager to share
     # a Queue between parent and workers, but this is fragile on Windows
     # (issue #1652).
     try:
+        if share_inputs:
+            min_bytes = config.get("multiprocessing.shared-input-min-bytes", 1_048_576)
+            dsk3, shared_inputs = share_graph_inputs(dsk3, min_bytes)
         # Run
         result = get_async(
             pool.submit,
@@ -247,8 +429,16 @@ def get(
             **kwargs,
         )
     finally:
-        if cleanup:
-            pool.shutdown()
+        # Shut the workers down before unlinking the segments so that no
+        # task is still reading storage that has been released. This also
+        # runs when a task failed or the user interrupted, after which the
+        # segments are reclaimed and subsequent computations are unaffected.
+        try:
+            if cleanup:
+                pool.shutdown()
+        finally:
+            if shared_inputs is not None:
+                shared_inputs.close()
     return result
 
 

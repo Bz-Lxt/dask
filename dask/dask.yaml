@@ -1,5 +1,9 @@
 temporary-directory: null  # Directory for local disk like /tmp, /scratch, or /local
 
+multiprocessing:
+  share-inputs: false  # Share large read-only array inputs via shared memory in the multiprocessing scheduler
+  shared-input-min-bytes: 1048576  # Minimum array size (in bytes) to share when share-inputs is true
+
 visualization:
   engine: null  # Default visualization engine to use when calling `.visualize()` on a collection
 
