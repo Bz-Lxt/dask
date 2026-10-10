@@ -688,6 +688,7 @@ def compute(
     optimize_graph=True,
     scheduler=None,
     get=None,
+    on_error=None,
     **kwargs,
 ):
     """Compute several dask collections at once.
@@ -714,6 +715,15 @@ def compute(
         useful for debugging.
     get : ``None``
         Should be left to ``None`` The get= keyword has been removed.
+    on_error : {"raise", "continue"}, optional
+        How to handle a task raising an exception when using a single-machine
+        scheduler (``"threads"``, ``"processes"`` or ``"synchronous"``).
+        ``"raise"`` (the default; falls back to the ``on-error`` config when
+        not given) aborts the whole computation on the first failure.
+        ``"continue"`` keeps running tasks unrelated to the failed branch and
+        returns :class:`dask.TaskFailure` markers in place of the affected
+        results, preserving the nested argument structure. Only the
+        single-machine schedulers are supported.
     kwargs
         Extra keywords to forward to the scheduler function.
 
@@ -730,6 +740,20 @@ def compute(
 
     >>> dask.compute({'a': a, 'b': b, 'c': 1})
     ({'a': np.int64(45), 'b': np.float64(4.5), 'c': 1},)
+
+    With ``on_error="continue"`` a failing branch does not prevent unrelated
+    results from being returned; the failed leaf is a :class:`dask.TaskFailure`
+    pointing at the task that actually failed:
+
+    >>> from dask import delayed
+    >>> @delayed
+    ... def boom():
+    ...     raise ValueError("boom")
+    >>> result = dask.compute({"ok": a, "bad": boom()}, on_error="continue")
+    >>> result[0]["ok"]  # doctest: +SKIP
+    np.int64(45)
+    >>> result[0]["bad"].root_key  # doctest: +SKIP
+    'boom-...'
     """
 
     collections, repack = unpack_collections(*args, traverse=traverse)
@@ -741,6 +765,20 @@ def compute(
         collections=collections,
         get=get,
     )
+    if on_error is not None:
+        local_schedulers = {local.get_async, local.get_sync}
+        if not EMSCRIPTEN:
+            from dask import multiprocessing as dask_multiprocessing
+            from dask import threaded
+
+            local_schedulers |= {threaded.get, dask_multiprocessing.get}
+        schedule_fn = schedule.func if isinstance(schedule, partial) else schedule
+        if schedule_fn not in local_schedulers:
+            raise NotImplementedError(
+                "on_error is only supported with the single-machine schedulers "
+                "('threads', 'processes' and 'synchronous'), not "
+                f"{schedule_fn!r}"
+            )
     from dask._expr import FinalizeCompute
 
     expr = collections_to_expr(collections, optimize_graph)
@@ -766,6 +804,8 @@ def compute(
         expr = expr.optimize()
         keys = list(flatten(expr.__dask_keys__()))
 
+        if on_error is not None:
+            kwargs["on_error"] = on_error
         results = schedule(expr, keys, **kwargs)
 
     return repack(results)

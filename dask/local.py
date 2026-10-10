@@ -110,11 +110,13 @@ See the function ``inline_functions`` for more information.
 from __future__ import annotations
 
 import os
-from collections import defaultdict
+import sys
+from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Executor, Future
 from functools import partial
 from queue import Empty, Queue
+from typing import Literal
 
 from dask import config
 from dask._task_spec import DataNode, convert_legacy_graph
@@ -227,6 +229,11 @@ def start_state_from_dask(dsk, cache=None, sortkey=None, keys=None):
         "running": set(),
         "finished": set(),
         "released": set(),
+        # Keys populated in ``on_error="continue"`` mode:
+        "failed": {},  # key -> (exception, traceback) of tasks that raised
+        "pruned": {},  # key -> immediate upstream key that caused pruning
+        "release_after": set(),  # running tasks whose data is freed on finish
+        "skipped": set(),  # never-submitted tasks orphaned by a failure
     }
 
     return state
@@ -296,7 +303,10 @@ def finish_task(
     Mutates.  This should run atomically (with a lock).
     """
     for dep in sorted(state["dependents"][key], key=sortkey, reverse=True):
-        s = state["waiting"][dep]
+        s = state["waiting"].get(dep)
+        if s is None or key not in s:
+            # dep was pruned after one of its other dependencies failed
+            continue
         s.remove(key)
         if not s:
             del state["waiting"][dep]
@@ -313,6 +323,10 @@ def finish_task(
 
     state["finished"].add(key)
     state["running"].remove(key)
+    if key in state.get("release_after", ()) and key not in results:
+        # The task was already running when its last dependent got pruned
+        state["release_after"].discard(key)
+        release_data(key, state, delete=delete)
 
     return state
 
@@ -345,6 +359,11 @@ def default_pack_exception(e, dumps):
     raise e
 
 
+def capture_pack_exception(e, dumps):
+    """Pack a task exception without raising, so the scheduler can continue."""
+    return e, sys.exc_info()[2]
+
+
 def reraise(exc, tb=None):
     if exc.__traceback__ is not tb:
         raise exc.with_traceback(tb)
@@ -358,6 +377,181 @@ def identity(x):
     3
     """
     return x
+
+
+class TaskFailure(Exception):
+    """Marker for a result key that could not be computed.
+
+    Returned in place of a result when the scheduler runs with
+    ``on_error="continue"``. A *root* failure stands for a task that actually
+    raised an exception; its :attr:`exception` and :attr:`traceback` are
+    populated. A *pruned* failure stands for a task that never ran because
+    one of its dependencies failed; ``exception`` is ``None`` and
+    :attr:`caused_by` links to the upstream failure. Follow :attr:`caused_by`
+    (or use :attr:`root_cause`) to reach the actual failure source.
+
+    Parameters
+    ----------
+    key : Key
+        Result key this marker stands in for.
+    exception : BaseException, optional
+        Exception raised by the task at ``key``. ``None`` for pruned keys.
+    traceback : traceback or str, optional
+        Traceback associated with ``exception``. With the process-based
+        scheduler this is a formatted string when tblib is not installed.
+    caused_by : TaskFailure, optional
+        Failure of the immediate upstream dependency that pruned this key.
+
+    Examples
+    --------
+    >>> from dask import delayed
+    >>> @delayed
+    ... def boom():
+    ...     raise ValueError("boom")
+    >>> result = dask.compute(boom(), on_error="continue")  # doctest: +SKIP
+    >>> failure = result[0]  # doctest: +SKIP
+    >>> isinstance(failure, dask.TaskFailure)  # doctest: +SKIP
+    True
+    >>> failure.root_cause.exception  # doctest: +SKIP
+    ValueError('boom')
+    """
+
+    def __init__(self, key, exception=None, traceback=None, caused_by=None):
+        self.key = key
+        self.exception = exception
+        self.traceback = traceback
+        self.caused_by = caused_by
+        super().__init__(key, exception)
+
+    @property
+    def root_cause(self) -> TaskFailure:
+        """The failure of the task that actually raised."""
+        failure = self
+        while failure.caused_by is not None:
+            failure = failure.caused_by
+        return failure
+
+    @property
+    def root_key(self) -> Key:
+        """Key of the task that actually raised."""
+        return self.root_cause.key
+
+    def reraise(self) -> None:
+        """Re-raise the original exception from the actually failed task."""
+        root = self.root_cause
+        if root.exception is None:
+            raise RuntimeError(f"Task {root.key!r} did not raise an exception")
+        reraise(root.exception, root.traceback)
+
+    def __repr__(self):
+        if self.caused_by is None:
+            return f"TaskFailure(key={self.key!r}, exception={self.exception!r})"
+        root = self.root_cause
+        return (
+            f"TaskFailure(key={self.key!r}, not run; caused by failure at "
+            f"{root.key!r}: {root.exception!r})"
+        )
+
+
+def prune_failed(key, exc, tb, state, results, release_data=release_data):
+    """Record a task failure and prune everything that depended on it.
+
+    Mutates ``state``. Data of tasks that only served the failed branch is
+    released immediately; tasks that had never been submitted and lost all
+    their dependents are skipped (their own dependencies are pruned in turn);
+    tasks already running are left alone and their data released on finish.
+
+    Parameters
+    ----------
+    key : Key
+        The task that raised.
+    exc, tb
+        The exception and its traceback.
+    state : dict
+        The scheduler state.
+    results : set
+        The requested result keys (never released).
+    """
+    state["failed"][key] = (exc, tb)
+    state["running"].discard(key)
+
+    def retire_orphan(dep):
+        # dep has no remaining dependents and is not a requested result.
+        if dep in state["failed"] or dep in state["pruned"]:
+            # Never produced data; nothing to release or skip.
+            return
+        if dep in state["cache"]:
+            release_data(dep, state)
+        elif dep in state["running"]:
+            # Cannot cancel a running task; free its data when it finishes.
+            state["release_after"].add(dep)
+        elif dep not in state["finished"]:
+            # Never submitted: skip it and orphan its own dependencies.
+            state["skipped"].add(dep)
+            if dep in state["ready"]:
+                state["ready"].remove(dep)
+            state["waiting"].pop(dep, None)
+            for subdep in state["dependencies"].get(dep, ()):
+                drop_consumer(subdep, dep)
+
+    def drop_consumer(dep, consumer):
+        consumers = state["waiting_data"].get(dep)
+        if consumers is None or consumer not in consumers:
+            return
+        consumers.remove(consumer)
+        if not consumers:
+            del state["waiting_data"][dep]
+            if dep not in results:
+                retire_orphan(dep)
+
+    # Forward prune: every (transitive) dependent of key can never run.
+    frontier = deque((dep, key) for dep in state["dependents"].get(key, ()))
+    while frontier:
+        pruned, cause = frontier.popleft()
+        if pruned in state["pruned"] or pruned in state["failed"]:
+            continue
+        state["pruned"][pruned] = cause
+        state["waiting"].pop(pruned, None)
+        for dep in state["dependencies"].get(pruned, ()):
+            drop_consumer(dep, pruned)
+        for dep in state["dependents"].get(pruned, ()):
+            if dep not in state["pruned"] and dep not in state["failed"]:
+                frontier.append((dep, pruned))
+
+    # key itself never got finish_task, so retire it as a consumer.
+    for dep in state["dependencies"].get(key, ()):
+        drop_consumer(dep, key)
+    state["waiting_data"].pop(key, None)
+
+
+def resolve_results(result, state):
+    """Assemble scheduler results, replacing failed keys with TaskFailure.
+
+    Mirrors the nested structure supported by ``nested_get``.
+    """
+    markers = {}
+
+    def marker_for(key):
+        if key in markers:
+            return markers[key]
+        if key in state["failed"]:
+            exc, tb = state["failed"][key]
+            marker = TaskFailure(key=key, exception=exc, traceback=tb)
+        else:
+            marker = TaskFailure(
+                key=key, caused_by=marker_for(state["pruned"][key])
+            )
+        markers[key] = marker
+        return marker
+
+    def resolve(ind):
+        if isinstance(ind, list):
+            return tuple(resolve(i) for i in ind)
+        if ind in state["cache"]:
+            return state["cache"][ind]
+        return marker_for(ind)
+
+    return resolve(result)
 
 
 """
@@ -393,6 +587,7 @@ def get_async(
     dumps=identity,
     loads=identity,
     chunksize=None,
+    on_error: Literal["raise", "continue"] | None = None,
     **kwargs,
 ):
     """Asynchronous get function
@@ -438,14 +633,40 @@ def get_async(
     chunksize: int, optional
         Size of chunks to use when dispatching work. Defaults to 1.
         If -1, will be computed to evenly divide ready work across workers.
+    on_error : {"raise", "continue"}, optional
+        How to handle a task raising an exception. ``"raise"`` (the default;
+        falls back to the ``on-error`` config when not given) aborts on the
+        first failure. ``"continue"`` records the failure, prunes the tasks
+        that depended on it, finishes all unrelated tasks and returns
+        :class:`TaskFailure` markers for the affected result keys instead of
+        raising. ``KeyboardInterrupt`` and ``SystemExit`` always abort.
 
     See Also
     --------
     threaded.get
+    TaskFailure
     """
     chunksize = chunksize or config.get("chunksize", 1)
+    if on_error is None:
+        on_error = config.get("on-error", "raise")
+    if on_error not in ("raise", "continue"):
+        raise ValueError(
+            f"on_error must be 'raise' or 'continue', got {on_error!r}"
+        )
+    if on_error == "continue" and pack_exception is default_pack_exception:
+        # The default packer re-raises inside the (synchronous) worker; to
+        # tolerate failures the exception must instead be reported back.
+        pack_exception = capture_pack_exception
 
     queue = Queue()
+    aborted = False
+    pending_futs: set[Future] = set()
+
+    def task_done(fut):
+        # After an abort the queue is abandoned; don't let late callbacks keep
+        # it (and its cached data) alive.
+        if not aborted:
+            queue.put(fut)
 
     if isinstance(result, list):
         result_flat = set(flatten(result))
@@ -528,37 +749,61 @@ def get_async(
                     if not each_args:
                         break
                     fut = submit(batch_execute_tasks, each_args)
-                    fut.add_done_callback(queue.put)
+                    pending_futs.add(fut)
+                    fut.add_done_callback(task_done)
 
             # Main loop, wait on tasks to finish, insert new ones
-            while state["waiting"] or state["ready"] or state["running"]:
-                fire_tasks(chunksize)
-                for key, res_info, failed in queue_get(queue).result():
-                    if failed:
-                        exc, tb = loads(res_info)
-                        if rerun_exceptions_locally:
-                            data = {
-                                dep: state["cache"][dep]
-                                for dep in get_dependencies(dsk, key)
-                            }
-                            task = dsk[key]
-                            task(data)  # Re-execute locally
-                        else:
+            try:
+                while state["waiting"] or state["ready"] or state["running"]:
+                    fire_tasks(chunksize)
+                    fut = queue_get(queue)
+                    try:
+                        finished = fut.result()
+                    finally:
+                        pending_futs.discard(fut)
+                    for key, res_info, failed in finished:
+                        if failed:
+                            exc, tb = loads(res_info)
+                            if isinstance(
+                                exc, (KeyboardInterrupt, SystemExit)
+                            ):
+                                # User interrupts / exits always abort, in
+                                # every mode.
+                                raise_exception(exc, tb)
+                            if on_error == "continue":
+                                # rerun_exceptions_locally is a debug aid that
+                                # re-raises in the scheduler; it is ignored here.
+                                prune_failed(key, exc, tb, state, results)
+                                continue
+                            if rerun_exceptions_locally:
+                                data = {
+                                    dep: state["cache"][dep]
+                                    for dep in get_dependencies(dsk, key)
+                                }
+                                task = dsk[key]
+                                task(data)  # Re-execute locally
                             raise_exception(exc, tb)
-                    res, worker_id = loads(res_info)
-                    state["cache"][key] = res
-                    finish_task(dsk, key, state, results, keyorder.get)
-                    for f in posttask_cbs:
-                        f(key, res, dsk, state, worker_id)
+                        res, worker_id = loads(res_info)
+                        state["cache"][key] = res
+                        finish_task(dsk, key, state, results, keyorder.get)
+                        for f in posttask_cbs:
+                            f(key, res, dsk, state, worker_id)
 
-            succeeded = True
+                succeeded = not state["failed"]
+            except BaseException:
+                # Cancel work that never started (running tasks can't be
+                # killed); the shared executor itself is left untouched.
+                aborted = True
+                for fut in pending_futs:
+                    fut.cancel()
+                raise
 
         finally:
             for _, _, _, _, finish in started_cbs:
                 if finish:
                     finish(dsk, state, not succeeded)
 
-    return nested_get(result, state["cache"])
+    return resolve_results(result, state)
 
 
 """ Synchronous concrete version of get_async

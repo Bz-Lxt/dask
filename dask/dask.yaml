@@ -1,4 +1,6 @@
-temporary-directory: null  # Directory for local disk like /tmp, /scratch, or /local
+temporary-directory: null  # Directory for temporary disk like /tmp, /scratch, or /local
+
+on-error: "raise"  # Single-machine schedulers: "raise" on first task failure, or "continue" returning dask.TaskFailure markers for affected results
 
 visualization:
   engine: null  # Default visualization engine to use when calling `.visualize()` on a collection

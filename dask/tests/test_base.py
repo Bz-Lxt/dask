@@ -534,6 +534,67 @@ def test_compute_nested():
     assert res[1] == 8
 
 
+def test_compute_on_error_continue_nested():
+    calls = []
+
+    @delayed
+    def shared():
+        calls.append(1)
+        return 10
+
+    @delayed
+    def good(x):
+        return x + 1
+
+    @delayed
+    def boom(x):
+        raise ValueError("boom")
+
+    s = shared()
+    a = good(s)
+    b = boom(s)
+    (result,) = compute(
+        {"ok": a, "bad": [b, a], "plain": 1},
+        scheduler="synchronous",
+        on_error="continue",
+    )
+
+    assert result["ok"] == 11
+    assert result["plain"] == 1
+    assert result["bad"][1] == 11
+    assert len(calls) == 1
+    failure = result["bad"][0]
+    assert isinstance(failure, dask.TaskFailure)
+    assert failure.root_key == b.key
+    assert isinstance(failure.root_cause.exception, ValueError)
+
+
+def test_compute_on_error_continue_method_and_config():
+    @delayed
+    def boom():
+        raise ValueError("boom")
+
+    b = boom()
+    result = b.compute(scheduler="synchronous", on_error="continue")
+    assert isinstance(result, dask.TaskFailure)
+    assert result.root_key == b.key
+
+    with dask.config.set({"on-error": "continue"}):
+        (result,) = compute(b, scheduler="synchronous")
+    assert isinstance(result, dask.TaskFailure)
+    assert result.root_key == b.key
+
+
+def test_compute_on_error_continue_unsupported_scheduler():
+    def foreign_get(dsk, keys, **kwargs):
+        raise AssertionError("should not be called")
+
+    with pytest.raises(NotImplementedError, match="single-machine"):
+        compute(
+            delayed(1)(), scheduler=foreign_get, on_error="continue"
+        )
+
+
 @pytest.mark.skipif("not da")
 @pytest.mark.skipif(
     bool(sys.flags.optimize), reason="graphviz exception with Python -OO flag"

@@ -202,6 +202,90 @@ def test_interrupt(use_barrier):
         tasks_can_end.set()
 
 
+def test_interrupt_leaves_scheduler_usable():
+    main_thread = threading.get_ident()
+
+    def interrupt_main() -> None:
+        signal.pthread_kill(main_thread, signal.SIGINT)
+
+    barrier = threading.Barrier(4)
+    tasks_can_end = threading.Event()
+
+    def f() -> None:
+        barrier.wait()
+        tasks_can_end.wait()
+
+    def interrupt() -> None:
+        barrier.wait()
+        interrupt_main()
+
+    dsk = {("f", i): (f,) for i in range(3)}
+    dsk["interrupt"] = (interrupt,)
+
+    with ThreadPoolExecutor(4) as pool:
+        with pytest.raises(KeyboardInterrupt):
+            get(dsk, list(dsk), pool=pool)
+        tasks_can_end.set()
+        # The supplied pool is still usable.
+        assert get({"a": (inc, 1)}, "a", pool=pool) == 2
+
+    # A later computation on the shared default pool works as well.
+    assert get({"b": (inc, 2)}, "b") == 3
+
+
+def test_on_error_continue():
+    counter = []
+
+    def shared():
+        counter.append(1)
+        return 10
+
+    def boom(x):
+        raise ValueError("boom")
+
+    dsk = {
+        "s": (shared,),
+        "good": (inc, "s"),
+        "bad": (boom, "s"),
+        "down": (inc, "bad"),
+    }
+    out = get(dsk, ["good", "down", "good"], on_error="continue")
+
+    assert out[0] == 11
+    assert out[2] == 11
+    assert len(counter) == 1
+    failure = out[1]
+    assert isinstance(failure, dask.TaskFailure)
+    assert failure.exception is None
+    assert failure.key == "down"
+    assert failure.root_key == "bad"
+    assert isinstance(failure.root_cause.exception, ValueError)
+
+
+def test_on_error_continue_still_aborts_on_interrupt():
+    main_thread = threading.get_ident()
+
+    def interrupt_main() -> None:
+        signal.pthread_kill(main_thread, signal.SIGINT)
+
+    barrier = threading.Barrier(2)
+    tasks_can_end = threading.Event()
+
+    def f() -> None:
+        barrier.wait()
+        tasks_can_end.wait()
+
+    def interrupt() -> None:
+        barrier.wait()
+        interrupt_main()
+
+    dsk = {"f": (f,), "interrupt": (interrupt,)}
+    with ThreadPoolExecutor(2) as pool:
+        with pytest.raises(KeyboardInterrupt):
+            get(dsk, list(dsk), pool=pool, on_error="continue")
+        tasks_can_end.set()
+
+
 def warm_up_thread_pool(num_workers: int | None) -> None:
     """Ensure that there is a warm thread pool.
 

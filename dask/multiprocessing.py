@@ -181,6 +181,10 @@ def get(
         Size of chunks to use when dispatching work.
         Defaults to 6 as some batching is helpful.
         If -1, will be computed to evenly divide ready work across workers.
+    on_error : {"raise", "continue"}, optional
+        How to handle a task raising an exception. ``"raise"`` (default)
+        aborts on the first failure; ``"continue"`` finishes unrelated tasks
+        and returns :class:`dask.TaskFailure` markers for affected results.
     """
     chunksize = chunksize or config.get("chunksize", 6)
     pool = pool or config.get("pool", None)
@@ -246,7 +250,12 @@ def get(
             chunksize=chunksize,
             **kwargs,
         )
-    finally:
+    except BaseException:
+        if cleanup:
+            # Don't wait for tasks still running in worker processes
+            pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
         if cleanup:
             pool.shutdown()
     return result

@@ -21,4 +21,5 @@ from dask.base import (
 )
 from dask.core import istask
 from dask.delayed import delayed
+from dask.local import TaskFailure
 from dask.local import get_sync as get

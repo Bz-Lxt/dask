@@ -80,6 +80,10 @@ def get(
         The number of threads to use in the ThreadPool that will actually execute tasks
     cache: dict-like (optional)
         Temporary storage of results
+    on_error : {"raise", "continue"}, optional
+        How to handle a task raising an exception. ``"raise"`` (default)
+        aborts on the first failure; ``"continue"`` finishes unrelated tasks
+        and returns :class:`dask.TaskFailure` markers for affected results.
 
     Examples
     --------

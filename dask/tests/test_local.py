@@ -4,7 +4,14 @@ import pytest
 
 import dask
 from dask._task_spec import Task, TaskRef
-from dask.local import finish_task, get_sync, sortkey, start_state_from_dask
+from dask.local import (
+    TaskFailure,
+    finish_task,
+    get_sync,
+    prune_failed,
+    sortkey,
+    start_state_from_dask,
+)
 from dask.order import order
 from dask.utils_test import GetFunctionTestMixin, add, inc
 
@@ -30,6 +37,10 @@ def test_start_state():
         "ready": ["z"],
         "waiting": {"w": {"z"}},
         "waiting_data": {"w": set(), "x": {"z"}, "y": {"w"}, "z": {"w"}},
+        "failed": {},
+        "pruned": {},
+        "release_after": set(),
+        "skipped": set(),
     }
     assert result == expected
 
@@ -89,6 +100,10 @@ def test_finish_task():
         "ready": ["w"],
         "waiting": {},
         "waiting_data": {"w": set(), "y": {"w"}, "z": {"w"}},
+        "failed": {},
+        "pruned": {},
+        "release_after": set(),
+        "skipped": set(),
     }
 
 
@@ -220,3 +235,166 @@ def test_detect_malformed_graph():
     with pytest.raises(ValueError, match="Missing dependency"):
         get_sync(dsk, "y")
     assert get_sync(dsk, "y", cache={"x": 1}) == 1
+
+
+def boom(x=None):
+    raise ValueError("boom")
+
+
+def test_on_error_default_raises():
+    with pytest.raises(ValueError, match="boom"):
+        get_sync({"k": (boom,)}, "k")
+
+
+def test_on_error_invalid():
+    with pytest.raises(ValueError, match="on_error"):
+        get_sync({"x": (inc, 1)}, "x", on_error="bogus")
+
+
+def test_on_error_continue_returns_unrelated_results():
+    dsk = {"bad": (boom,), "good": (inc, 1)}
+    good, bad = get_sync(dsk, ["good", "bad"], on_error="continue")
+
+    assert good == 2
+    assert isinstance(bad, TaskFailure)
+    assert bad.key == "bad"
+    assert isinstance(bad.exception, ValueError)
+    assert bad.caused_by is None
+    assert bad.root_key == "bad"
+    assert bad.root_cause is bad
+
+
+def test_on_error_continue_shared_runs_once():
+    counter = []
+
+    def shared():
+        counter.append(1)
+        return 10
+
+    dsk = {
+        "s": (shared,),
+        "g": (inc, "s"),
+        "b": (boom, "s"),
+    }
+    good, bad = get_sync(dsk, ["g", "b"], on_error="continue")
+
+    assert good == 11
+    assert isinstance(bad, TaskFailure)
+    assert bad.root_key == "b"
+    assert len(counter) == 1
+
+
+def test_on_error_continue_pruned_points_to_root():
+    # k fails; p1 and p2 never run; two separate failed roots feed two leaves
+    # and a common merge, so both actual failure sources stay identifiable.
+    def boom2():
+        raise RuntimeError("other boom")
+
+    dsk = {
+        "k": (boom,),
+        "p1": (lambda x: x, "k"),
+        "p2": (lambda x: x, "p1"),
+        "k2": (boom2,),
+        "q2": (lambda x: x, "k2"),
+        "merge": (lambda a, b: (a, b), "p2", "q2"),
+        "good": (inc, 1),
+    }
+    good, leaf, leaf2, merge = get_sync(
+        dsk, ["good", "p2", "q2", "merge"], on_error="continue"
+    )
+
+    assert good == 2
+    assert isinstance(leaf, TaskFailure)
+    assert leaf.exception is None
+    assert leaf.key == "p2"
+    assert leaf.caused_by.key == "p1"
+    assert leaf.root_key == "k"
+    assert isinstance(leaf.root_cause.exception, ValueError)
+
+    assert isinstance(leaf2, TaskFailure)
+    assert leaf2.root_key == "k2"
+    assert isinstance(leaf2.root_cause.exception, RuntimeError)
+
+    assert isinstance(merge, TaskFailure)
+    assert merge.key == "merge"
+    assert merge.exception is None
+    assert merge.root_key in {"k", "k2"}
+    assert isinstance(
+        merge.root_cause.exception, (ValueError, RuntimeError)
+    )
+
+
+def test_prune_failed_skips_orphans():
+    # q feeds only p; when k fails and p is pruned, q (still ready and never
+    # submitted) must be skipped rather than executed.
+    dsk = {
+        "k": (boom,),
+        "q": (inc, 1),
+        "p": (lambda x, y: (x, y), "k", "q"),
+    }
+    state = start_state_from_dask(dsk, keys={"p"})
+
+    prune_failed("k", ValueError("boom"), None, state, {"p"})
+
+    assert set(state["failed"]) == {"k"}
+    assert state["pruned"] == {"p": "k"}
+    assert "q" in state["skipped"]
+    assert "q" not in state["ready"]
+    assert "q" not in state["cache"]
+    assert state["waiting"] == {}
+    assert state["running"] == set()
+    assert "k" not in state["skipped"]
+
+
+def test_on_error_continue_releases_dead_branch_data():
+    captured = []
+
+    def capture_state(dsk, state, errored):
+        captured.append((state, errored))
+
+    counter = []
+
+    def shared():
+        counter.append(1)
+        return 10
+
+    dsk = {
+        "s": (shared,),
+        "good": (inc, "s"),
+        "bad": (boom, "s"),
+        "pruned": (lambda x: x, "bad"),
+    }
+    out = get_sync(
+        dsk,
+        ["good", "pruned"],
+        on_error="continue",
+        callbacks=[(None, None, None, None, capture_state)],
+    )
+    assert out[0] == 11
+    assert isinstance(out[1], TaskFailure)
+    assert out[1].root_key == "bad"
+    assert len(counter) == 1
+
+    state, errored = captured[0]
+    assert errored is True
+    # Branch-only intermediate was released; the successful result stays.
+    assert "s" in state["released"]
+    assert "good" in state["cache"]
+    assert "bad" not in state["cache"]
+    assert set(state["failed"]) == {"bad"}
+    assert "pruned" in state["pruned"]
+
+
+def test_on_error_continue_keyboard_interrupt_aborts():
+    def interrupt():
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        get_sync(
+            {"k": (interrupt,), "good": (inc, 1)},
+            ["k", "good"],
+            on_error="continue",
+        )
+
+    # The scheduler is still usable afterwards.
+    assert get_sync({"x": (inc, 1)}, "x") == 2

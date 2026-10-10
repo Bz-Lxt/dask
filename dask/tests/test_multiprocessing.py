@@ -299,8 +299,54 @@ def test_custom_context_ignored_elsewhere():
 
 @pytest.mark.skipif(sys.platform != "win32", reason="POSIX supports different contexts")
 def test_get_context_always_default():
-    """On Python 2/Windows, get_context() always returns same context."""
+    """On Python 2/Windows, get_context() always returns same process."""
     assert get_context() is multiprocessing
     with pytest.warns(UserWarning):
         with dask.config.set({"multiprocessing.context": "forkserver"}):
             assert get_context() is multiprocessing
+
+
+def _on_error_shared():
+    return 10
+
+
+def _on_error_good(x):
+    return x + 1
+
+
+def _on_error_boom(x):
+    raise ValueError("boom")
+
+
+def _on_error_down(x):
+    return x
+
+
+def test_on_error_continue():
+    dsk = {
+        "s": (_on_error_shared,),
+        "good": (_on_error_good, "s"),
+        "bad": (_on_error_boom, "s"),
+        "down": (_on_error_down, "bad"),
+    }
+    good, down, good2 = get(
+        dsk,
+        ["good", "down", "good"],
+        num_workers=2,
+        optimize_graph=False,
+        on_error="continue",
+    )
+
+    assert good == 11
+    assert good2 == 11
+    assert isinstance(down, dask.TaskFailure)
+    assert down.key == "down"
+    assert down.exception is None
+    assert down.root_key == "bad"
+    assert isinstance(down.root_cause.exception, ValueError)
+
+
+def test_on_error_default_raises():
+    dsk = {"bad": (_on_error_boom, 1)}
+    with pytest.raises(Exception, match="boom"):
+        get(dsk, "bad", num_workers=2)

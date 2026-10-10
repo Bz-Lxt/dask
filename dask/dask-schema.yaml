@@ -11,6 +11,18 @@ properties:
       When the value is "null" (default), dask will create a directory from
       where dask was launched: `cwd/dask-worker-space`
 
+  on-error:
+    type: string
+    enum:
+    - raise
+    - continue
+    description: |
+      Behavior of the single-machine schedulers (threads, processes,
+      synchronous) when a task raises an exception. ``"raise"`` (default)
+      aborts on the first failure. ``"continue"`` finishes tasks unrelated
+      to the failed branch and returns ``dask.TaskFailure`` markers in place
+      of the affected results.
+
   visualization:
     type: object
     properties:
