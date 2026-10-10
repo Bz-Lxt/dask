@@ -32,8 +32,8 @@ pools: defaultdict[threading.Thread, dict[int, Executor]] = defaultdict(dict)
 pools_lock = Lock()
 
 
-def pack_exception(e, dumps):
-    return e, sys.exc_info()[2]
+def pack_exception(e, dumps, records=()):
+    return e, sys.exc_info()[2], records
 
 
 class ContextAwareThreadPoolExecutor(ThreadPoolExecutor):

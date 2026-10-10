@@ -54,12 +54,17 @@ should contain the dependencies of the task.
     t({"a": 1, "b": 2}) == 3
 
 """
+import contextvars
 import functools
 import itertools
+import os
 import sys
-from collections import defaultdict
+import threading
+from collections import defaultdict, namedtuple
 from collections.abc import Callable, Container, Iterable, Mapping, MutableMapping
+from contextlib import contextmanager
 from functools import lru_cache, partial
+from timeit import default_timer
 from typing import Any, TypeVar, cast
 
 from dask.sizeof import sizeof
@@ -198,6 +203,88 @@ def _execute_subgraph(inner_dsk, outkey, inkeys, *dependencies):
         final[k] = DataNode(None, v)
     res = execute_graph(final, keys=[outkey])
     return res[outkey]
+
+
+# Stores execution data for each task, including tasks executed as part of a
+# fused subgraph. The first five fields match the ``TaskData`` namedtuple so the
+# records can be rendered by the same timeline plot.
+SubtaskData = namedtuple(
+    "SubtaskData",
+    (
+        "key",
+        "task",
+        "start_time",
+        "end_time",
+        "worker_id",
+        "parent_key",
+        "depth",
+        "exception",
+    ),
+)
+
+_record_buffer: contextvars.ContextVar[TaskRecordBuffer | None] = (
+    contextvars.ContextVar("_record_buffer", default=None)
+)
+# Stack of keys of the enclosing subgraph tasks; its length is the current
+# nesting depth and its last entry is the key of the owning (fused) task.
+_record_stack: contextvars.ContextVar[tuple[tuple[KeyType], ...]] = (
+    contextvars.ContextVar("_record_stack", default=())
+)
+
+
+class TaskRecordBuffer:
+    """Collects ``SubtaskData`` records for the duration of one scheduler task."""
+
+    __slots__ = ("records",)
+
+    def __init__(self) -> None:
+        self.records: list[SubtaskData] = []
+
+    @contextmanager
+    def track(self, task: Task):
+        stack = _record_stack.get()
+        parent_key = stack[-1][0] if stack else None
+        depth = len(stack)
+        stack_token = None
+        if task.has_subgraph():
+            # Tasks executed within this subgraph are attributed to it
+            stack_token = _record_stack.set((*stack, (task.key,)))
+        start = default_timer()
+        exception = None
+        try:
+            yield
+        except BaseException as exc:
+            exception = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            end = default_timer()
+            self.records.append(
+                SubtaskData(
+                    task.key,
+                    task,
+                    start,
+                    end,
+                    (os.getpid(), threading.get_ident()),
+                    parent_key,
+                    depth,
+                    exception,
+                )
+            )
+            if stack_token is not None:
+                _record_stack.reset(stack_token)
+
+
+@contextmanager
+def task_record_buffer():
+    """Install a fresh buffer collecting every task executed in this context."""
+    buffer = TaskRecordBuffer()
+    buffer_token = _record_buffer.set(buffer)
+    stack_token = _record_stack.set(())
+    try:
+        yield buffer
+    finally:
+        _record_buffer.reset(buffer_token)
+        _record_stack.reset(stack_token)
 
 
 def convert_legacy_task(
@@ -761,11 +848,20 @@ class Task(GraphNode):
             else:
                 return a
 
-        new_argspec = tuple(map(_eval, self.args))
-        if self.kwargs:
-            kwargs = {k: _eval(kw) for k, kw in self.kwargs.items()}
-            return self.func(*new_argspec, **kwargs)
-        return self.func(*new_argspec)
+        buffer = _record_buffer.get()
+        if buffer is None:
+            new_argspec = tuple(map(_eval, self.args))
+            if self.kwargs:
+                kwargs = {k: _eval(kw) for k, kw in self.kwargs.items()}
+                return self.func(*new_argspec, **kwargs)
+            return self.func(*new_argspec)
+
+        with buffer.track(self):
+            new_argspec = tuple(map(_eval, self.args))
+            if self.kwargs:
+                kwargs = {k: _eval(kw) for k, kw in self.kwargs.items()}
+                return self.func(*new_argspec, **kwargs)
+            return self.func(*new_argspec)
 
     def __setstate__(self, state):
         slots = self.__class__.get_all_slots()

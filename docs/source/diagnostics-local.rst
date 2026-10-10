@@ -13,6 +13,7 @@ This page describes the following few built-in options:
 2.  Profiler
 3.  ResourceProfiler
 4.  CacheProfiler
+5.  SubtaskProfiler
 
 Furthermore, this page then provides instructions on how to build your own custom diagnostic.
 
@@ -130,6 +131,38 @@ the number of bytes in the scheduler cache:
     >>> cprof = CacheProfiler(metric=nbytes)
 
 
+SubtaskProfiler
+---------------
+
+.. autosummary::
+   SubtaskProfiler
+
+When task fusion is enabled, several original operations are executed as a
+single scheduled task, so the ``Profiler`` can no longer show where the time
+is spent. The ``SubtaskProfiler`` records every individual operation,
+including the operations folded inside fused tasks, while fusion and the other
+optimizations are left untouched. For each operation it records:
+
+1. Key
+2. Task
+3. Start time in seconds since the epoch
+4. Finish time in seconds since the epoch
+5. Worker id, as a ``(process id, thread id)`` tuple
+6. Key of the fused task the operation belongs to (``None`` for unfused tasks)
+7. Nesting depth (0 for scheduled tasks, 1 inside a fused task)
+8. Exception message if the operation failed
+
+Records are rendered by the same bokeh timeline as ``Profiler`` results, where
+the extra information is available by hovering over each block:
+
+.. code-block:: python
+
+    >>> from dask.diagnostics import SubtaskProfiler
+    >>> with SubtaskProfiler() as sprof:
+    ...     out = a2.compute()
+    >>> sprof.visualize()
+
+
 Example
 -------
 
@@ -243,7 +276,7 @@ Custom Callbacks
 
 Schedulers based on ``dask.local.get_async`` (currently
 ``dask.get``, ``dask.threaded.get``, and ``dask.multiprocessing.get``)
-accept five callbacks, allowing for inspection of scheduler execution.
+accept six callbacks, allowing for inspection of scheduler execution.
 
 The callbacks are:
 
@@ -263,6 +296,10 @@ the scheduler state, and the id of the worker that ran the task
 5. ``finish(dsk, state, errored)``: Run at the end of execution, right before the
 result is returned. Receives the Dask graph, the scheduler state, and a boolean
 indicating whether or not the exit was due to an error
+
+6. ``subtask(records)``: Run every time a task finishes (or fails), receiving
+the records of the individual operations executed within it, including the
+operations inside fused tasks
 
 Custom diagnostics can be created either by instantiating the ``Callback``
 class with the some of the above methods as keywords or by subclassing the
@@ -313,11 +350,13 @@ API
    Profiler
    ProgressBar
    ResourceProfiler
+   SubtaskProfiler
    visualize
 
 .. autofunction:: ProgressBar
 .. autofunction:: Profiler
 .. autofunction:: ResourceProfiler
 .. autofunction:: CacheProfiler
+.. autofunction:: SubtaskProfiler
 .. autofunction:: Callback
 .. autofunction:: visualize

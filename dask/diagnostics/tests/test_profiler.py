@@ -9,7 +9,7 @@ from timeit import default_timer
 import pytest
 
 from dask._task_spec import Task
-from dask.diagnostics import CacheProfiler, Profiler, ResourceProfiler
+from dask.diagnostics import CacheProfiler, Profiler, ResourceProfiler, SubtaskProfiler
 from dask.diagnostics.profile_visualize import BOKEH_VERSION
 from dask.threaded import get
 from dask.utils import tmpfile
@@ -387,3 +387,182 @@ def test_get_colors():
     funcs = list(range(300))
     cmap = get_colors("Viridis", funcs)
     assert len(set(cmap)) == len(set(Viridis[256]))
+
+
+inc = lambda x: x + 1
+
+
+def make_fused_dsk():
+    t1 = Task("x", add, 1, 2)
+    t2 = Task("y", inc, t1.ref())
+    fused = Task.fuse(t1, t2, key="z")
+    return {"z": fused}
+
+
+def by_key(prof):
+    return {d.key: d for d in prof.results}
+
+
+def test_subtask_profiler():
+    with SubtaskProfiler() as sprof:
+        in_context_time = default_timer()
+        out = get(make_fused_dsk(), "z")
+    assert out == 4
+    assert sprof.start_time < in_context_time < sprof.end_time
+
+    assert sorted(by_key(sprof)) == ["x", "y", "z"]
+    data = by_key(sprof)
+    # The original operations are attributed to the owning fused task
+    assert data["x"].parent_key == "z"
+    assert data["y"].parent_key == "z"
+    assert data["x"].depth == 1
+    assert data["y"].depth == 1
+    # The scheduled task itself is recorded at depth 0 with no parent
+    assert data["z"].parent_key is None
+    assert data["z"].depth == 0
+    # Threads share the current process id
+    assert all(d.worker_id[0] == os.getpid() for d in sprof.results)
+    # Intervals are ordered and fall within the fused task interval
+    assert data["z"].start_time <= data["x"].start_time < data["x"].end_time
+    assert data["x"].end_time <= data["y"].start_time < data["y"].end_time
+    assert data["y"].end_time <= data["z"].end_time
+    assert all(d.exception is None for d in sprof.results)
+
+    sprof.clear()
+    assert sprof.results == []
+
+
+def test_subtask_profiler_unfused():
+    dsk = {"a": Task("a", add, 1, 2)}
+    with SubtaskProfiler() as sprof:
+        assert get(dsk, "a") == 3
+    (record,) = sprof.results
+    assert record.key == "a"
+    assert record.depth == 0
+    assert record.parent_key is None
+
+
+def test_subtask_profiler_nested():
+    t1 = Task("a", add, 1, 2)
+    t2 = Task("b", inc, t1.ref())
+    middle = Task.fuse(t1, t2, key="m")
+    t3 = Task("c", inc, middle.ref())
+    outer = Task.fuse(middle, t3, key="z")
+
+    with SubtaskProfiler() as sprof:
+        assert get({"z": outer}, "z") == 5
+    data = by_key(sprof)
+    assert data["z"].depth == 0
+    assert data["m"].depth == 1
+    assert data["m"].parent_key == "z"
+    assert data["c"].depth == 1
+    assert data["c"].parent_key == "z"
+    assert data["a"].depth == 2
+    assert data["a"].parent_key == "m"
+    assert data["b"].depth == 2
+    assert data["b"].parent_key == "m"
+
+
+def test_subtask_profiler_works_under_error():
+    def boom(x):
+        raise ValueError("boom")
+
+    t1 = Task("a", add, 1, 2)
+    t2 = Task("b", boom, t1.ref())
+    fused = Task.fuse(t1, t2, key="z")
+
+    with pytest.raises(ValueError, match="boom"):
+        with SubtaskProfiler() as sprof:
+            get({"z": fused}, "z")
+
+    data = by_key(sprof)
+    # The operation that ran is recorded, the failed op and fused task too
+    assert data["a"].exception is None
+    assert "ValueError: boom" in data["b"].exception
+    assert "ValueError: boom" in data["z"].exception
+
+
+def test_subtask_profiler_recollect():
+    dsk = make_fused_dsk()
+    with SubtaskProfiler() as sprof:
+        get(dsk, "z")
+    n, first_session = len(sprof.results), sprof.session_id
+    assert n == 3
+
+    # Re-entering starts an independent collection session
+    with sprof:
+        get(dsk, "z")
+    assert len(sprof.results) == n
+    assert sprof.session_id != first_session
+
+
+def test_subtask_profiler_register():
+    sprof = SubtaskProfiler()
+    try:
+        sprof.register()
+        get(make_fused_dsk(), "z")
+        assert len(sprof.results) == 3
+        get(make_fused_dsk(), "z")
+        assert len(sprof.results) == 6
+    finally:
+        sprof.unregister()
+
+
+def test_subtask_profiler_multiprocessing():
+    from dask.multiprocessing import get as mp_get
+
+    with SubtaskProfiler() as sprof:
+        assert mp_get(make_fused_dsk(), "z", num_workers=2) == 4
+    data = by_key(sprof)
+    assert sorted(data) == ["x", "y", "z"]
+    # Records were gathered from a different process
+    assert all(d.worker_id[0] != os.getpid() for d in sprof.results)
+    assert data["x"].parent_key == "z"
+    assert data["x"].depth == 1
+    assert data["z"].depth == 0
+
+
+def test_subtask_profiler_multiprocessing_under_error():
+    from dask.multiprocessing import RemoteException
+    from dask.multiprocessing import get as mp_get
+
+    def boom(x):
+        raise ValueError("boom")
+
+    t1 = Task("a", add, 1, 2)
+    t2 = Task("b", boom, t1.ref())
+    fused = Task.fuse(t1, t2, key="z")
+
+    with pytest.raises((ValueError, RemoteException)):
+        with SubtaskProfiler() as sprof:
+            mp_get({"z": fused}, "z", num_workers=2)
+    data = by_key(sprof)
+    assert "ValueError: boom" in data["b"].exception
+
+
+@pytest.mark.skipif("not bokeh")
+def test_subtask_profiler_plot():
+    with SubtaskProfiler() as sprof:
+        get(make_fused_dsk(), "z")
+    p = sprof.visualize(
+        width=500,
+        height=300,
+        tools="hover",
+        title="Not the default",
+        show=False,
+        save=False,
+    )
+    assert p.width == 500
+    assert p.height == 300
+    assert len(p.tools) == 1
+    assert isinstance(p.tools[0], bokeh.models.HoverTool)
+    assert p.title.text == "Not the default"
+    source = p.renderers[0].data_source.data
+    assert sorted(source["key"]) == ["x", "y", "z"]
+    assert source["depth"].count("1") == 2
+
+    # Test empty, checking for errors
+    sprof.clear()
+    with warnings.catch_warnings(record=True) as record:
+        sprof.visualize(show=False, save=False)
+    assert not record

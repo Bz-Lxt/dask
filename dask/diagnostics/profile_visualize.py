@@ -182,7 +182,9 @@ def plot_tasks(
     defaults.update(**kwargs)
 
     if results:
-        keys, tasks, starts, ends, ids = zip(*results)
+        # Records may carry extra fields (e.g. SubtaskData); only the first five
+        # fields are needed for the plot
+        keys, tasks, starts, ends, ids = zip(*(r[:5] for r in results))
 
         id_group = groupby(itemgetter(4), results)
         timings = {
@@ -208,6 +210,19 @@ def plot_tasks(
         data["function"] = funcs = [repr(i) for i in tasks]
         data["color"] = get_colors(palette, funcs)
         data["key"] = [str(i) for i in keys]
+        # Attribution fields are only present on sub-operation records; use
+        # empty strings elsewhere so the extra hover rows stay blank.
+        if hasattr(results[0], "parent_key"):
+            data["parent"] = [
+                str(r.parent_key) if r.parent_key is not None else "" for r in results
+            ]
+            data["depth"] = [str(r.depth) for r in results]
+            data["error"] = [r.exception or "" for r in results]
+        else:
+            n = len(results)
+            data["parent"] = [""] * n
+            data["depth"] = [""] * n
+            data["error"] = [""] * n
 
         source = bp.ColumnDataSource(data=data)
 
@@ -237,6 +252,18 @@ def plot_tasks(
     <div>
         <span style="font-size: 14px; font-weight: bold;">Task:</span>&nbsp;
         <span style="font-size: 10px; font-family: Monaco, monospace;">@function</span>
+    </div>
+    <div>
+        <span style="font-size: 14px; font-weight: bold;">Parent:</span>&nbsp;
+        <span style="font-size: 10px; font-family: Monaco, monospace;">@parent</span>
+    </div>
+    <div>
+        <span style="font-size: 14px; font-weight: bold;">Depth:</span>&nbsp;
+        <span style="font-size: 10px; font-family: Monaco, monospace;">@depth</span>
+    </div>
+    <div>
+        <span style="font-size: 14px; font-weight: bold;">Error:</span>&nbsp;
+        <span style="font-size: 10px; font-family: Monaco, monospace;">@error</span>
     </div>
     """
     hover.point_policy = "follow_mouse"

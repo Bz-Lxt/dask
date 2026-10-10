@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import uuid
 from collections import namedtuple
 from itertools import starmap
 from multiprocessing import Pipe, Process, current_process
 from time import sleep
 from timeit import default_timer
 
+from dask._task_spec import SubtaskData
 from dask.callbacks import Callback
 from dask.utils import import_required
 
@@ -409,6 +411,100 @@ class CacheProfiler(Callback):
         """Clear out old results from profiler"""
         self.results = []
         self._cache = {}
+        self._dsk = {}
+        self.start_time = None
+        self.end_time = None
+
+
+class SubtaskProfiler(Callback):
+    """A profiler for dask execution at the original-operation level.
+
+    Unlike ``Profiler``, which records one entry per scheduled task, this
+    profiler records every operation executed, including the individual
+    operations folded into fused tasks. Fusion and other optimizations are
+    left untouched.
+
+    Records the following information for each operation:
+        1. Key
+        2. Task
+        3. Start time in seconds since the epoch
+        4. Finish time in seconds since the epoch
+        5. Worker id as a ``(process id, thread id)`` tuple
+        6. Key of the owning fused task (``None`` for unfused tasks)
+        7. Nesting depth (0 for scheduled tasks, 1 inside a fused task)
+        8. Exception message, if the operation failed
+
+    Examples
+    --------
+
+    >>> from operator import add
+    >>> from dask._task_spec import Task
+    >>> from dask.threaded import get
+    >>> from dask.diagnostics import SubtaskProfiler
+    >>> t1 = Task("x", add, 1, 2)
+    >>> t2 = Task("y", add, t1.ref(), 10)
+    >>> fused = Task.fuse(t1, t2, key="z")
+    >>> with SubtaskProfiler() as sprof:
+    ...     get({"z": fused}, "z")
+    13
+
+    The fused task ``z`` and both original operations ``x``, ``y`` are recorded.
+
+    >>> sorted(d.key for d in sprof.results)  # doctest: +SKIP
+    ['x', 'y', 'z']
+
+    These results can be visualized in the same bokeh timeline plot as
+    ``Profiler`` results. Note that this requires bokeh to be installed.
+
+    >>> sprof.visualize()  # doctest: +SKIP
+
+    As with the other profilers, it can be activated globally and old results
+    can be cleared manually.
+
+    >>> sprof.clear()      # doctest: +SKIP
+    """
+
+    def __init__(self):
+        self.clear()
+        self.session_id = None
+
+    def __enter__(self):
+        self.clear()
+        self.session_id = uuid.uuid4().hex
+        self.start_time = default_timer()
+        return super().__enter__()
+
+    def __exit__(self, *args):
+        self.end_time = default_timer()
+        return super().__exit__(*args)
+
+    def _start(self, dsk):
+        self._dsk.update(dsk)
+
+    def _subtask(self, records):
+        self.results.extend(records)
+
+    def _plot(self, **kwargs):
+        from dask.diagnostics.profile_visualize import plot_tasks
+
+        return plot_tasks(
+            self.results, self._dsk, self.start_time, self.end_time, **kwargs
+        )
+
+    def visualize(self, **kwargs):
+        """Visualize the profiling run in a bokeh plot.
+
+        See also
+        --------
+        dask.diagnostics.profile_visualize.visualize
+        """
+        from dask.diagnostics.profile_visualize import visualize
+
+        return visualize(self, **kwargs)
+
+    def clear(self):
+        """Clear out old results from profiler"""
+        self.results: list[SubtaskData] = []
         self._dsk = {}
         self.start_time = None
         self.end_time = None

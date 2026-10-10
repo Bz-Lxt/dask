@@ -109,7 +109,9 @@ See the function ``inline_functions`` for more information.
 
 from __future__ import annotations
 
+import contextlib
 import os
+import sys
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Executor, Future
@@ -117,7 +119,7 @@ from functools import partial
 from queue import Empty, Queue
 
 from dask import config
-from dask._task_spec import DataNode, convert_legacy_graph
+from dask._task_spec import DataNode, convert_legacy_graph, task_record_buffer
 from dask.callbacks import local_callbacks, unpack_callbacks
 from dask.core import flatten, get_dependencies
 from dask.order import order
@@ -243,22 +245,39 @@ When we execute tasks we both
 """
 
 
-def execute_task(key, task_info, dumps, loads, get_id, pack_exception):
+def execute_task(
+    key, task_info, dumps, loads, get_id, pack_exception, record=False
+):
     """
     Compute task and handle all administration
+
+    If ``record`` is true, per-task execution records (including records of
+    tasks inside fused subgraphs) are collected and returned alongside the
+    result, even when the task fails.
 
     See Also
     --------
     _execute_task : actually execute task
     """
+    records = ()
+    buffer = None
     try:
         task, data = loads(task_info)
-        result = task(data)
+        if record:
+            context: contextlib.AbstractContextManager = task_record_buffer()
+        else:
+            context = contextlib.nullcontext()
+        with context as buffer:
+            result = task(data)
+        if record:
+            records = buffer.records
         id = get_id()
-        result = dumps((result, id))
+        result = dumps((result, id, records))
         failed = False
     except BaseException as e:
-        result = pack_exception(e, dumps)
+        if record and buffer is not None:
+            records = buffer.records
+        result = pack_exception(e, dumps, records)
         failed = True
     return key, result, failed
 
@@ -341,8 +360,8 @@ def default_get_id():
     return None
 
 
-def default_pack_exception(e, dumps):
-    raise e
+def default_pack_exception(e, dumps, records=()):
+    return e, sys.exc_info()[2], records
 
 
 def reraise(exc, tb=None):
@@ -457,7 +476,15 @@ def get_async(
         dsk = dsk.__dask_graph__()
     dsk = convert_legacy_graph(dsk)
     with local_callbacks(callbacks) as callbacks:
-        _, _, pretask_cbs, posttask_cbs, _ = unpack_callbacks(callbacks)
+        (
+            _,
+            _,
+            pretask_cbs,
+            posttask_cbs,
+            _,
+            subtask_cbs,
+        ) = unpack_callbacks(callbacks)
+        record = bool(subtask_cbs)
         started_cbs = []
         succeeded = False
         # if start_state_from_dask fails, we will have something
@@ -475,7 +502,7 @@ def get_async(
                 dsk, keys=results, cache=cache, sortkey=keyorder.get
             )
 
-            for _, start_state, _, _, _ in callbacks:
+            for _, start_state, _, _, _, _ in callbacks:
                 if start_state:
                     start_state(dsk, state)
 
@@ -519,6 +546,7 @@ def get_async(
                             loads,
                             get_id,
                             pack_exception,
+                            record,
                         )
                     )
 
@@ -534,8 +562,12 @@ def get_async(
             while state["waiting"] or state["ready"] or state["running"]:
                 fire_tasks(chunksize)
                 for key, res_info, failed in queue_get(queue).result():
+                    payload = loads(res_info)
                     if failed:
-                        exc, tb = loads(res_info)
+                        exc, tb, *extra = payload
+                        records = extra[0] if extra else ()
+                        for f in subtask_cbs:
+                            f(records)
                         if rerun_exceptions_locally:
                             data = {
                                 dep: state["cache"][dep]
@@ -545,16 +577,19 @@ def get_async(
                             task(data)  # Re-execute locally
                         else:
                             raise_exception(exc, tb)
-                    res, worker_id = loads(res_info)
+                    res, worker_id, *extra = payload
+                    records = extra[0] if extra else ()
                     state["cache"][key] = res
                     finish_task(dsk, key, state, results, keyorder.get)
                     for f in posttask_cbs:
                         f(key, res, dsk, state, worker_id)
+                    for f in subtask_cbs:
+                        f(records)
 
             succeeded = True
 
         finally:
-            for _, _, _, _, finish in started_cbs:
+            for _, _, _, _, finish, _ in started_cbs:
                 if finish:
                     finish(dsk, state, not succeeded)
 

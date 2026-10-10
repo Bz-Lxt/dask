@@ -22,6 +22,8 @@ class Callback:
     ...     pass
     >>> def finish(dsk, state, failed):
     ...     pass
+    >>> def subtask(records):
+    ...     pass
 
     You may then construct a callback object with any number of them
 
@@ -50,7 +52,13 @@ class Callback:
     active: ClassVar[set[tuple[Callable | None, ...]]] = set()
 
     def __init__(
-        self, start=None, start_state=None, pretask=None, posttask=None, finish=None
+        self,
+        start=None,
+        start_state=None,
+        pretask=None,
+        posttask=None,
+        finish=None,
+        subtask=None,
     ):
         if start:
             self._start = start
@@ -62,10 +70,19 @@ class Callback:
             self._posttask = posttask
         if finish:
             self._finish = finish
+        if subtask:
+            self._subtask = subtask
 
     @property
     def _callback(self) -> tuple[Callable | None, ...]:
-        fields = ["_start", "_start_state", "_pretask", "_posttask", "_finish"]
+        fields = [
+            "_start",
+            "_start_state",
+            "_pretask",
+            "_posttask",
+            "_finish",
+            "_subtask",
+        ]
         return tuple(getattr(self, i, None) for i in fields)
 
     def __enter__(self):
@@ -86,9 +103,10 @@ class Callback:
 def unpack_callbacks(cbs):
     """Take an iterable of callbacks, return a list of each callback."""
     if cbs:
+        cbs = [normalize_callback(cb) for cb in cbs]
         return [[i for i in f if i] for f in zip(*cbs)]
     else:
-        return [(), (), (), (), ()]
+        return [(), (), (), (), (), ()]
 
 
 @contextmanager
@@ -112,6 +130,9 @@ def normalize_callback(cb):
     if isinstance(cb, Callback):
         return cb._callback
     elif isinstance(cb, tuple):
+        # Older callbacks are 5-tuples without the ``subtask`` hook
+        if len(cb) < 6:
+            cb = (*cb, *(None,) * (6 - len(cb)))
         return cb
     else:
         raise TypeError("Callbacks must be either `Callback` or `tuple`")
